@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sentinel Process Overview</title>
+  <style>
+    :root {
+      --ink: #1f2a37;
+      --muted: #5b6470;
+      --paper: #f7f8fb;
+      --panel: #ffffff;
+      --line: #e6e9ef;
+
+      --brand-700: #0f4d3f;
+      --brand-500: #1f8f74;
+      --brand-200: #daf3eb;
+
+      --blue-200: #dbeafe;
+      --amber-200: #fef3c7;
+      --rose-200: #ffe4e6;
+      --slate-200: #e2e8f0;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Space Grotesk", "Segoe UI", Tahoma, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 85% 10%, rgba(31,143,116,0.12), transparent 30%),
+        radial-gradient(circle at 10% 90%, rgba(15,77,63,0.10), transparent 35%),
+        linear-gradient(180deg, #f4f7f5 0%, #f7f8fb 45%, #f3f5fa 100%);
+      padding: 28px 16px 40px;
+    }
+
+    .container {
+      max-width: 1140px;
+      margin: 0 auto;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: 0 20px 50px rgba(16, 24, 40, 0.08);
+      overflow: hidden;
+    }
+
+    .header {
+      background:
+        linear-gradient(130deg, #0f4d3f 0%, #176857 55%, #1f8f74 100%);
+      color: #fff;
+      padding: 34px 28px 28px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .header::after {
+      content: "";
+      position: absolute;
+      right: -120px;
+      top: -120px;
+      width: 300px;
+      height: 300px;
+      border-radius: 50%;
+      border: 2px dashed rgba(255, 255, 255, 0.22);
+      transform: rotate(16deg);
+    }
+
+    .header h1 {
+      font-size: clamp(1.5rem, 3vw, 2rem);
+      letter-spacing: 0.4px;
+      margin-bottom: 8px;
+    }
+
+    .header p {
+      max-width: 840px;
+      line-height: 1.6;
+      opacity: 0.92;
+      font-size: 0.98rem;
+    }
+
+    .meta {
+      margin-top: 12px;
+      font-size: 0.82rem;
+      opacity: 0.78;
+    }
+
+    .pipeline-badge {
+      margin-top: 16px;
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      background: rgba(255,255,255,0.16);
+      border: 1px solid rgba(255,255,255,0.25);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 0.84rem;
+      font-weight: 700;
+    }
+
+    .step {
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.18);
+      color: #fff;
+      white-space: nowrap;
+    }
+
+    .step.active {
+      background: #fff;
+      color: #0f4d3f;
+    }
+
+    .step.pending {
+      background: rgba(255,255,255,0.1);
+      color: rgba(255,255,255,0.82);
+      border: 1px dashed rgba(255,255,255,0.5);
+    }
+
+    .sep { opacity: 0.66; }
+
+    .content { padding: 26px; }
+
+    h2 {
+      margin: 28px 0 12px;
+      font-size: 1.3rem;
+      color: #124f42;
+      border-bottom: 2px solid #1f8f74;
+      padding-bottom: 6px;
+    }
+
+    p { line-height: 1.72; color: #2a3442; }
+
+    .version-status {
+      background: #f3fbf8;
+      border: 1px solid #bee8da;
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin-bottom: 24px;
+    }
+
+    .vs-title {
+      font-size: 0.75rem;
+      letter-spacing: 1.7px;
+      text-transform: uppercase;
+      color: #3a4a59;
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+
+    .vs-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+    }
+
+    .vs-item {
+      background: #fff;
+      border: 1px solid #d7eee6;
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+
+    .vs-item strong { display: block; font-size: 0.92rem; margin-bottom: 5px; }
+
+    .vbadge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-family: "IBM Plex Mono", Consolas, monospace;
+      background: #0f4d3f;
+      color: #fff;
+      border-radius: 6px;
+      padding: 3px 8px;
+      font-size: 0.78rem;
+      margin-bottom: 4px;
+    }
+
+    .vdate { opacity: 0.8; }
+    .vstate { font-size: 0.8rem; color: var(--muted); }
+
+    .layers { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
+
+    .layer {
+      border-radius: 10px;
+      padding: 16px 18px;
+      border-left: 5px solid #bbb;
+    }
+
+    .layer-label {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 1.7px;
+      font-weight: 700;
+      margin-bottom: 10px;
+      color: #495465;
+    }
+
+    .layer-client { background: #eef6ff; border-left-color: #3b82f6; }
+    .layer-agent { background: #ebf9f4; border-left-color: #10b981; }
+    .layer-external { background: #fff9e8; border-left-color: #f59e0b; }
+    .layer-data { background: #fff1f2; border-left-color: #f43f5e; }
+
+    .boxes {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+    }
+
+    .box {
+      background: #fff;
+      border: 1px solid #e5eaf2;
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 0.9rem;
+      font-weight: 700;
+      text-align: center;
+      box-shadow: 0 3px 8px rgba(17, 24, 39, 0.04);
+    }
+
+    .box small {
+      display: block;
+      margin-top: 5px;
+      font-size: 0.76rem;
+      color: #5b6470;
+      font-weight: 500;
+      line-height: 1.4;
+    }
+
+    .arrow {
+      text-align: center;
+      color: #6b7280;
+      font-size: 1.15rem;
+      font-weight: 700;
+      padding: 2px 0;
+    }
+
+    .arrow span {
+      display: block;
+      font-size: 0.75rem;
+      font-weight: 500;
+      font-style: italic;
+      color: #7a8391;
+      margin-top: 2px;
+    }
+
+    .agent-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 14px;
+      margin-top: 10px;
+    }
+
+    .agent-card {
+      border: 1px solid #d9e2ec;
+      border-radius: 12px;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    .agent-card-header {
+      background: linear-gradient(130deg, #0f4d3f, #1f8f74);
+      color: #fff;
+      padding: 14px;
+    }
+
+    .agent-card-header .step-num {
+      font-size: 0.72rem;
+      opacity: 0.82;
+      letter-spacing: 0.8px;
+      margin-bottom: 4px;
+    }
+
+    .agent-card-header h3 {
+      font-size: 1.02rem;
+      margin-bottom: 6px;
+    }
+
+    .card-version {
+      font-family: "IBM Plex Mono", Consolas, monospace;
+      font-size: 0.74rem;
+      background: rgba(255,255,255,0.18);
+      border-radius: 4px;
+      display: inline-block;
+      padding: 3px 7px;
+    }
+
+    .agent-card-body {
+      padding: 12px 14px 14px;
+      font-size: 0.9rem;
+    }
+
+    .agent-card-body dl {
+      display: grid;
+      grid-template-columns: 98px 1fr;
+      row-gap: 6px;
+      column-gap: 8px;
+    }
+
+    .agent-card-body dt { font-weight: 700; color: #1b3a34; }
+    .agent-card-body dd { color: #314152; line-height: 1.5; }
+
+    .status-chip {
+      display: inline-block;
+      font-size: 0.74rem;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 999px;
+      border: 1px solid;
+    }
+
+    .is-defined { color: #0f6b53; border-color: #7cd8be; background: #ebfaf4; }
+    .is-planned { color: #8a5a00; border-color: #f3d28a; background: #fff8e5; }
+
+    pre {
+      margin: 10px 0 0;
+      background: #111827;
+      color: #dde5f4;
+      border-radius: 10px;
+      padding: 14px;
+      overflow-x: auto;
+      font-family: "IBM Plex Mono", Consolas, monospace;
+      font-size: 0.83rem;
+      line-height: 1.6;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      font-size: 0.9rem;
+    }
+
+    th {
+      text-align: left;
+      background: #13463b;
+      color: #fff;
+      padding: 10px;
+      font-weight: 700;
+    }
+
+    td {
+      padding: 9px 10px;
+      border-bottom: 1px solid #e9edf4;
+      vertical-align: top;
+      color: #2d3a4a;
+    }
+
+    tr:nth-child(even) td { background: #fafbfd; }
+
+    .footer {
+      margin-top: 24px;
+      background: #102e27;
+      color: #b5c1be;
+      text-align: center;
+      padding: 14px;
+      font-size: 0.8rem;
+    }
+
+    @media (max-width: 720px) {
+      .content { padding: 18px; }
+      .pipeline-badge { border-radius: 16px; }
+      .agent-card-body dl { grid-template-columns: 84px 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Sentinel Process Overview</h1>
+      <p>Sentinel workflow build status for this repository. This page only shows artifacts that are currently defined and created in the workspace.</p>
+      <div class="pipeline-badge">
+        <span class="step active">01 Harvest</span>
+        <span class="sep">-&gt;</span>
+        <span class="step pending">02 Temper</span>
+        <span class="sep">-&gt;</span>
+        <span class="step pending">03 Forging</span>
+        <span class="sep">-&gt;</span>
+        <span class="step pending">04 Polish</span>
+        <span class="sep">-&gt;</span>
+        <span class="step pending">05 Crucible</span>
+      </div>
+      <div class="meta">Generated on <span id="generated-date"></span></div>
+    </div>
+
+    <div class="content">
+      <div class="version-status">
+        <div class="vs-title">Sentinel Subflow Status</div>
+        <div class="vs-grid">
+          <div class="vs-item">
+            <strong>Harvest</strong>
+            <div class="vbadge"><span>v0.2.1</span> <span class="vdate">2026-08-11</span></div>
+            <div class="vstate">Agent, prompt, wizard script, and output scaffold exist in this repository.</div>
+          </div>
+          <div class="vs-item">
+            <strong>Workflow Definition</strong>
+            <div class="vbadge"><span>5 steps</span> <span class="vdate">defined</span></div>
+            <div class="vstate">Temper, Forging, Polish, and Crucible are defined as names only (no agent files yet).</div>
+          </div>
+        </div>
+      </div>
+
+      <h2>1. Introduction</h2>
+      <p>This page documents the current Sentinel implementation state in this workspace. It intentionally excludes future placeholders and only lists files and outputs that already exist.</p>
+      <p>At this moment, the implemented workflow scope is Harvest. The remaining Sentinel subflow names are part of the defined roadmap but are not yet created as repository artifacts.</p>
+
+      <h2>2. Architecture Overview</h2>
+      <p>The process is organized as layered responsibilities from user interaction to generated test outcomes.</p>
+
+      <div class="layers">
+        <div class="layer layer-client">
+          <div class="layer-label">Client Layer</div>
+          <div class="boxes">
+            <div class="box">VS Code + Copilot Chat<small>Primary workspace interaction</small></div>
+            <div class="box">Browser Process Page<small>Visual process and status reference</small></div>
+          </div>
+        </div>
+
+        <div class="arrow">v<span>User starts Sentinel workflow</span></div>
+
+        <div class="layer layer-agent">
+          <div class="layer-label">Agent Layer</div>
+          <div class="boxes">
+              <div class="box">01 Harvest<small>Reads Jira and normalizes requirements</small></div>
+              <div class="box">Defined Next Steps<small>Temper, Forging, Polish, Crucible (not yet created as files)</small></div>
+          </div>
+        </div>
+
+        <div class="arrow">v<span>Agents consume prompts and instructions</span></div>
+
+        <div class="layer layer-external">
+          <div class="layer-label">Knowledge Layer</div>
+          <div class="boxes">
+            <div class="box">Prompt Files<small>Task framing and output contracts</small></div>
+            <div class="box">Instruction Files<small>Quality, ISTQB, and DoR/DoD rules</small></div>
+            <div class="box">Jira Input<small>User story and acceptance criteria source</small></div>
+          </div>
+        </div>
+
+        <div class="arrow">v<span>Structured outputs are persisted in repository</span></div>
+
+        <div class="layer layer-data">
+          <div class="layer-label">Output Layer</div>
+          <div class="boxes">
+            <div class="box">Harvest Handoff Packet<small>Requirements, AC matrix, risks, and open questions for next step</small></div>
+          </div>
+        </div>
+      </div>
+
+      <h2>3. Subflow Details</h2>
+      <div class="agent-cards">
+        <div class="agent-card">
+          <div class="agent-card-header">
+            <div class="step-num">STEP 01 - SENTINEL</div>
+            <h3>Harvest - Read Jira</h3>
+            <div class="card-version">v0.1.0 | 2026-08-10</div>
+          </div>
+          <div class="agent-card-body">
+            <dl>
+              <dt>File</dt><dd>agents/01-Harvest-Read-Jira.Agent.md</dd>
+              <dt>Status</dt><dd><span class="status-chip is-defined">Defined</span></dd>
+              <dt>Prompt</dt><dd>Prompts/01-Harvest-Read-Jira.prompt.md</dd>
+              <dt>Script</dt><dd>Scripts/Harvest-wizard.cjs</dd>
+              <dt>Output folder</dt><dd>01-Harvest-Jira-Summaries/</dd>
+              <dt>Goal</dt><dd>Create a complete, test-ready requirement package for Temper.</dd>
+            </dl>
+          </div>
+        </div>
+
+        <div class="agent-card">
+          <div class="agent-card-header">
+            <div class="step-num">NEXT - SENTINEL</div>
+            <h3>Defined Subflow Names (No Files Yet)</h3>
+            <div class="card-version">roadmap only</div>
+          </div>
+          <div class="agent-card-body">
+            <dl>
+              <dt>Status</dt><dd><span class="status-chip is-planned">Defined only</span></dd>
+              <dt>Subflows</dt><dd>Temper, Forging, Polish, Crucible</dd>
+              <dt>Current state</dt><dd>No corresponding agent files are created in this repository yet.</dd>
+              <dt>Activation</dt><dd>These will be expanded here only after each agent file is created.</dd>
+            </dl>
+          </div>
+        </div>
+      </div>
+
+      <h2>4. End-to-End Data Flow</h2>
+      <pre>1. Harvest reads Jira and creates a structured requirement package.
+2. Harvest outputs a Temper handoff packet (requirements, acceptance criteria links, risks, open questions).
+    3. Harvest wizard supports browser input and confirmation flow for the Harvest step.
+    4. Next subflow creation is pending and will be added after its agent file exists.</pre>
+
+      <h2>5. Current Repository Artifacts</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Artifact</th>
+            <th>Purpose</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>agents/01-Harvest-Read-Jira.Agent.md</td>
+            <td>Defines Harvest role, analysis requirements, and Temper handoff contract.</td>
+            <td>Implemented</td>
+          </tr>
+          <tr>
+            <td>prompts/01-Harvest-Read-Jira.prompt.md</td>
+            <td>Harvest prompt entry point wired to agent 01-Harvest-Read-Jira.</td>
+            <td>Implemented</td>
+          </tr>
+          <tr>
+            <td>Scripts/Harvest-wizard.cjs</td>
+            <td>Browser wizard for Jira key intake, working progress, summary review, and confirmation.</td>
+            <td>Implemented</td>
+          </tr>
+          <tr>
+            <td>01-Harvest-Jira-Summaries/README.md</td>
+            <td>Harvest output folder conventions for summary and metadata files per Jira key.</td>
+            <td>Implemented</td>
+          </tr>
+          <tr>
+            <td>instructions/01-Harvest-DoR-DoD.instructions.md</td>
+            <td>Readiness and done quality gates for test automation work.</td>
+            <td>Implemented</td>
+          </tr>
+          <tr>
+            <td>instructions/01-Harvest-test-istqb.instructions.md</td>
+            <td>ISTQB and Agile testing guidance used in workflow foundations.</td>
+            <td>Implemented</td>
+          </tr>
+          <tr>
+            <td>98_Process Overview/Sentinel-Process-Overview.html</td>
+            <td>Repository process overview page for current Sentinel implementation state.</td>
+            <td>Implemented</td>
+          </tr>
+          <tr>
+            <td>99_Version Control/00-Sentinel-VersionControl.md</td>
+            <td>Sentinel-specific change log for process-overview and related repository updates.</td>
+            <td>Implemented</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="footer">Sentinel Process Overview - living architecture page for workflow build-up</div>
+  </div>
+
+  <script>
+    const d = new Date();
+    const formatted = d.toLocaleDateString("nl-NL", { year: "numeric", month: "long", day: "numeric" });
+    document.getElementById("generated-date").textContent = formatted;
+  </script>
+</body>
+</html>

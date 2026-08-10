@@ -1,0 +1,23 @@
+{
+  "durationMs": 5000,
+  "backgroundColor": "#faf8ec",
+  "logoBlendMode": "darken",
+  "logoBackgroundColor": "transparent",
+  "cornerBlendMode": "multiply",
+  "cornerBackgroundColor": "#faf8ec",
+  "cornerWidthPx": 112,
+  "cornerMaxWidthVw": 14,
+  "cornerOpacity": 1,
+  "cornerFilter": "contrast(1.04) saturate(1.03)",
+  "imagesFolderName": "Sentinel",
+  "mainImageCandidates": [
+    "Harvest.png",
+    "harvest.png",
+    "Sentinel.png"
+  ],
+  "cornerImageCandidates": [
+    "AI generated.jpg",
+    "AI generated.png",
+    "AI generated - dark.png"
+  ]
+}
