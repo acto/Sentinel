@@ -32,6 +32,6 @@ Apply these standards when developing and validating all Thinkwise E2E tests in 
 
 ## 3. Specific Instructions for AI Assistance
 - Always apply `await` syntax for all Playwright and Testwise actions.
-- When generating code: prefer `testwise-playwright` library methods for grid interactions and the action bar.
+- When generating code: prefer Playwright library methods for grid interactions and the action bar.
 - When setting up new tests, always enforce the viewport setting to 1920x1080.
 - Immediately flag if a request does not appear to meet the DoR or DoD rules above.

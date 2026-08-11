@@ -158,3 +158,111 @@
 - Reverted the skill location change to preserve VS Code/Copilot skill autoload behavior.
 - Moved `Fetch JIRA items` back to `.github/skills/fetch-jira-items/SKILL.md`.
 - Removed temporary `97_Skills` skill location.
+
+## 2026-08-11 - v0.2.34
+- Updated `Scripts/Harvest-wizard.cjs` Analyze step to explicitly position the first validation as Definition of Ready (DoR)-focused.
+- Updated DoR warning text in summary to reference only DoR criteria and DoR status file wording.
+- Added DoR section metadata (`sourceSection: Definition of Ready (DoR)`) to the generated DoR check payload.
+
+## 2026-08-11 - v0.2.35
+- Updated `Scripts/Harvest-wizard.cjs` DoR check to evaluate both Jira descriptions and the text content of selected (`aangevinkte`) attachments.
+- Added attachment evidence extraction for text-based files (`txt`, `md`, `json`, `xml`, `yaml`, `csv`, and similar text MIME types).
+- Extended selected attachment payload with `contentUrl` and `mimeType` so DoR analysis can download and parse selected Jira attachments.
+- Added DoR evidence metadata (`descriptionsUsed`, `selectedAttachments`, `extractedAttachmentTexts`, `skippedAttachments`, `failedAttachments`) to `jira-dor-check.json`.
+
+## 2026-08-11 - v0.2.36
+- Updated `Scripts/Harvest-wizard.cjs` DoR logic with a separate check for the presence of acceptance criteria, in addition to the existing Given/When/Then format check.
+- Added explicit checklist item `Acceptance Criteria aanwezig` and retained format-specific validation as `Acceptance Criteria format (Given/When/Then)`.
+
+## 2026-08-11 - v0.2.37
+- Updated `Scripts/Harvest-wizard.cjs` DoR checklist to merge acceptance checks into one block: `Acceptatie Criteria`.
+- The single block now reports both sub-results: presence of acceptance criteria and Given/When/Then format coverage.
+
+## 2026-08-11 - v0.2.38
+- Updated `Instructions/01-Harvest-DoR-DoD.instructions.md` wording to prefer Playwright (instead of `testwise-playwright`) in the AI assistance guidance.
+
+## 2026-08-11 - v0.2.39
+- Updated `Scripts/Harvest-wizard.cjs` DoR `Acceptatie Criteria` note output to show two separate lines:
+- `Aanwezigheid: ...`
+- `Format (Given/When/Then): ...`
+
+## 2026-08-11 - v0.2.40
+- Updated Harvest analyze flow to generate both checks after clicking `Analyseren`: DoR check and a second testability check.
+- Added testability check generation in `Scripts/Harvest-wizard.cjs` using `Instructions/01-Harvest-test-istqb.instructions.md` as source reference.
+- Replaced primary check page route with `http://127.0.0.1:3133/pre-check` (legacy `/dor-check` kept as alias for compatibility).
+- Updated pre-check UI to display results of both checks on one page: `DoR check` and `Testbaarheid check`.
+
+## 2026-08-11 - v0.2.41
+- Added reusable Harvest analysis skill `jira-items-analyse` at `.github/skills/jira-items-analyse/SKILL.md`.
+- Captured the post-`Analyseren` flow contract: DoR check first, testability check second, both shown on one combined `pre-check` page.
+- Documented required evidence sources (descriptions + selected attachments) and output artifacts for both checks.
+
+## 2026-08-11 - v0.2.42
+- Added prompt `Prompts/03-Harvest-Jira-Items-Analyse.prompt.md` to explicitly start the Jira items analysis phase with skill `jira-items-analyse`.
+- Wired prompt to agent `01-Harvest-Read-Jira` with guidance for combined pre-check execution (DoR + testability).
+
+## 2026-08-11 - v0.2.43
+- Removed dedicated skill prompts `Prompts/02-Harvest-Fetch-Jira-Items.prompt.md` and `Prompts/03-Harvest-Jira-Items-Analyse.prompt.md`.
+- Kept skill definitions available via `.github/skills` without separate start prompts.
+
+## 2026-08-11 - v0.2.44
+- Updated `Scripts/Harvest-wizard.cjs` so clicking `Doorgaan` on `pre-check` now generates an uitgebreide Jira samenvatting before opening `Samenvatting`.
+- Summary generation now includes root/sub-item descriptions, selected attachments (including image-aware classification), and Jira comments.
+- Added explicit `Pre-check aandachtspunten (niet voldaan)` section in the summary so failed DoR/Testbaarheid criteria stay prominent.
+
+## 2026-08-11 - v0.2.45
+- Updated `Scripts/Harvest-wizard.cjs` summary generation to produce synthesized summaries instead of copying raw source text verbatim.
+- Added condensed source-driven sections for descriptions, comments, and attachment content with ranked kernpunten.
+- Added explicit source coverage counters and retained prominent pre-check afwijkingen in the summary output.
+
+## 2026-08-11 - v0.2.46
+- Updated `Scripts/Harvest-wizard.cjs` status header in generated summaries to remove `Root item` and `Sub-items` fields.
+- Changed `Aangemaakt` timestamp formatting from UTC ISO to locale-aware local time including detected timezone label.
+
+## 2026-08-11 - v0.2.47
+- Fixed attachment evidence selection in `Scripts/Harvest-wizard.cjs` so summary generation no longer drops selected attachments due to an `include` filter mismatch.
+- Extended text attachment detection to include common document types (`pdf`, `doc`, `docx`, `rtf`, `html`) so document content can be considered for text extraction.
+
+## 2026-08-11 - v0.2.48
+- Updated `Scripts/Harvest-wizard.cjs` to generate one `Overkoepelende samenvatting` based on all available sources (beschrijvingen, opmerkingen, bijlage-tekstextracten) instead of multiple separate summary blocks.
+- Added explicit `Brondekking` output that lists how many attachments were extracted and which attachment files were actually verwerkt, plus skipped/failed reasons.
+
+## 2026-08-11 - v0.2.49
+- Expanded `Overkoepelende samenvatting` in `Scripts/Harvest-wizard.cjs` with a larger evidence window and extra depth for test preparation.
+- Added structured `Verdieping voor testontwerp` subsections with source-driven signals for scope, acceptance/assertions, testdata/toegang, and risico's/afhankelijkheden.
+
+## 2026-08-11 - v0.2.50
+- Reworked attachment extraction in `Scripts/Harvest-wizard.cjs` to read payloads as binary buffers and parse DOCX/PDF content with dedicated libraries.
+- Added binary-gibberish guard to prevent unreadable archive/binary content (e.g. `PK...`) from entering the summary text.
+- Added explicit parser-related skip/fail reasons (`docx-parser-missing`, `pdf-parser-missing`, `docx-parse-failed`, `pdf-parse-failed`, `binary-content`).
+
+## 2026-08-11 - v0.2.51
+- Updated `Scripts/Harvest-wizard.cjs` to show `Aangemaakt` in local date-time format without appending timezone text (e.g. removed `(Europe/Berlin)`).
+- Removed the testscenario/testscript checkpoint subsection from `Verdieping voor testontwerp` to keep this phase focused on test basis input for testplan preparation.
+
+## 2026-08-11 - v0.2.52
+- Improved readability of `Pre-check aandachtspunten (niet voldaan)` in `Scripts/Harvest-wizard.cjs` by rendering each finding as a header line with indented detail lines.
+- Preserved multi-line note details (for example `Aanwezigheid` and `Format (Given/When/Then)`) as separate readable sub-bullets.
+
+## 2026-08-11 - v0.2.53
+- Updated `Pre-check aandachtspunten` formatting in `Scripts/Harvest-wizard.cjs` to show standalone heading lines and tab-indented `•` detail lines for clearer visual alignment.
+- Added spacing between findings so DoR and Testbaarheid items are easier to scan.
+
+## 2026-08-11 - v0.2.54
+- Tightened `Pre-check aandachtspunten` formatting in `Scripts/Harvest-wizard.cjs` by removing empty lines between heading lines and bullet details, and between bullet groups.
+
+## 2026-08-11 - v0.2.55
+- Updated markdown rendering in `Scripts/Harvest-wizard.cjs` so `•` detail lines are displayed with explicit left indentation for improved readability under pre-check headings.
+
+## 2026-08-11 - v0.2.56
+- Updated `Scripts/Harvest-wizard.cjs` so clicking `Bevestigen` now persists the current summary to a timestamped markdown file in `01-Harvest-Jira-Summaries`.
+- Added confirmation state handling so the summary page reloads with `Bevestigen` hidden and `Doorgaan` shown after successful save.
+- Added `/summary-continue` endpoint for post-confirm continuation from the summary page.
+
+## 2026-08-11 - v0.2.57
+- Adjusted summary persistence to match the ActoForge format: fixed filenames `harvest-<JIRAKEY>.md` and `harvest-<JIRAKEY>.meta.json` in `01-Harvest-Jira-Summaries`.
+- Implemented `.meta.json` content with `harvestedAt`, root `jiraUpdated`, and `children` updated timestamps sourced from fetched Jira data.
+
+## 2026-08-11 - v0.2.58
+- Added new skill `.github/skills/jira-summary/SKILL.md` to standardize Harvest summary generation from descriptions, comments, and selected attachments including extraction guardrails.
+- Documented summary persistence contract in the skill for `harvest-<JIRAKEY>.md` and `harvest-<JIRAKEY>.meta.json` plus required metadata fields.

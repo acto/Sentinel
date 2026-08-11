@@ -14,7 +14,8 @@
  * Stdout signals (read by agent via get_terminal_output):
  *   RESULT:bevestigd   — user submitted a valid Jira key
  *   RESULT:cancelled   — user cancelled
- *   CONFIRMED:ok       — user confirmed fetched Jira data
+ *   RESULT:analyse-started — user started analysis after Jira fetch
+ *   CONFIRMED:ok       — user confirmed final summary
  */
 'use strict';
 
@@ -22,6 +23,11 @@ const http = require('http');
 const fs   = require('fs');
 const cp   = require('child_process');
 const path = require('path');
+
+let mammoth = null;
+let pdfParse = null;
+try { mammoth = require('mammoth'); } catch (_) { mammoth = null; }
+try { pdfParse = require('pdf-parse'); } catch (_) { pdfParse = null; }
 
 const PORT         = 3133;
 const TEMP         = process.env.TEMP || require('os').tmpdir();
@@ -59,11 +65,14 @@ const JIRA_LOGO = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAqcAAAGQCAMAAAC
 const answersPath  = path.join(TEMP, 'jira-wizard-answers.json');
 const actionPath   = path.join(TEMP, 'jira-action.txt');
 const summaryPath  = path.join(TEMP, 'jira-summary.md');
+const summaryConfirmedPath = path.join(TEMP, 'jira-summary-confirmed.json');
 const warningPath  = path.join(TEMP, 'jira-existing-warning.json');
 const fetchedPath      = path.join(TEMP, 'jira-fetched.json');
 const fetchErrorPath   = path.join(TEMP, 'jira-fetch-error.json');
 const dorCheckPath = path.join(TEMP, 'jira-dor-check.json');
 const testabilityCheckPath = path.join(TEMP, 'jira-testability-check.json');
+const dorDodInstructionsPath = path.join(WORKSPACE, 'Instructions', '01-Harvest-DoR-DoD.instructions.md');
+const testIstqbInstructionsPath = path.join(WORKSPACE, 'Instructions', '01-Harvest-test-istqb.instructions.md');
 const redirectHtml = path.join(TEMP, 'Harvest-wizard-redirect.html');
 const chromeProfileDir = path.join(TEMP, 'SentinelChrome', 'Harvest');
 
@@ -463,6 +472,13 @@ function mdToHtmlSummary(md) {
 
       if (!t) { if (inUl) { out += '</ul>\n'; inUl = false; } return; }
 
+      var dotBullet = raw.match(/^\s*•\s+(.+)$/);
+      if (dotBullet) {
+        if (inUl) { out += '</ul>\n'; inUl = false; }
+        out += '<p style="margin-left:18px">• ' + inline(dotBullet[1]) + '</p>\n';
+        return;
+      }
+
       if (/^[-*] /.test(t)) {
 
         if (!inUl) { out += '<ul>\n'; inUl = true; }
@@ -591,6 +607,29 @@ function writeFetchError(code, message, details) {
     at: new Date().toISOString()
   };
   try { fs.writeFileSync(fetchErrorPath, JSON.stringify(payload, null, 2), 'utf8'); } catch (_) {}
+}
+
+function getLocalTimestampParts(d) {
+  const dt = d instanceof Date ? d : new Date();
+  const pad = function(n) { return String(n).padStart(2, '0'); };
+  return {
+    year: String(dt.getFullYear()),
+    month: pad(dt.getMonth() + 1),
+    day: pad(dt.getDate()),
+    hour: pad(dt.getHours()),
+    minute: pad(dt.getMinutes()),
+    second: pad(dt.getSeconds())
+  };
+}
+
+function buildSummaryTimestampForFile(d) {
+  const p = getLocalTimestampParts(d);
+  return p.year + p.month + p.day + '-' + p.hour + p.minute + p.second;
+}
+
+function buildSummaryTimestampForDisplay(d) {
+  const p = getLocalTimestampParts(d);
+  return p.day + '-' + p.month + '-' + p.year + ' ' + p.hour + ':' + p.minute + ':' + p.second;
 }
 
 function parseMcpToolResult(result) {
@@ -1029,6 +1068,786 @@ async function fetchJiraViaRest(jiraKey, mergedEnv) {
   return data;
 }
 
+function isLikelyTextAttachment(fileName, mimeType) {
+  const name = String(fileName || '').toLowerCase();
+  const mime = String(mimeType || '').toLowerCase();
+
+  if (mime.startsWith('text/')) return true;
+  if (mime.includes('json') || mime.includes('xml') || mime.includes('yaml')) return true;
+  if (mime.includes('rtf') || mime.includes('msword') || mime.includes('officedocument')) return true;
+  if (mime.includes('pdf')) return true;
+
+  return /\.(txt|md|markdown|csv|tsv|json|xml|yml|yaml|log|feature|gherkin|ini|cfg|conf|html?|rtf|pdf|doc|docx)$/i.test(name);
+}
+
+function resolveAtlassianAuth(mergedEnv) {
+  const env = mergedEnv && typeof mergedEnv === 'object' ? mergedEnv : process.env;
+  const email = String(env.ATLASSIAN_EMAIL || '').trim();
+  const token = String(env.ATLASSIAN_API_TOKEN || '').trim();
+  if (!email || !token) return null;
+  const auth = Buffer.from(email + ':' + token, 'utf8').toString('base64');
+  return { Authorization: 'Basic ' + auth };
+}
+
+function buildAttachmentCatalogFromFetched(fetched) {
+  const catalog = [];
+  const seen = new Set();
+
+  const root = pickRootIssueForChecks(fetched) || {};
+  const children = pickChildIssuesForChecks(fetched);
+  const allIssues = [root].concat(children);
+
+  for (const issue of allIssues) {
+    if (!issue || !issue.fields || typeof issue.fields !== 'object') continue;
+    const issueKey = String(issue.key || issue.issueKey || issue.id || '').trim();
+    const attachments = Array.isArray(issue.fields.attachment) ? issue.fields.attachment : [];
+    for (const a of attachments) {
+      if (!a || typeof a !== 'object') continue;
+      const id = String(a.id || a.attachmentId || '').trim();
+      const filename = String(a.filename || a.name || '').trim();
+      const contentUrl = String(a.content || a.url || '').trim();
+      const mimeType = String(a.mimeType || a.mimetype || '').trim();
+      const key = [issueKey, id, filename, contentUrl].join('|');
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      catalog.push({
+        issueKey: issueKey,
+        id: id,
+        filename: filename,
+        contentUrl: contentUrl,
+        mimeType: mimeType
+      });
+    }
+  }
+
+  return catalog;
+}
+
+function findAttachmentInCatalog(selected, catalog) {
+  const issueKey = String(selected && selected.issueKey || '').trim();
+  const id = String(selected && selected.id || '').trim();
+  const filename = String(selected && selected.filename || '').trim();
+
+  let hit = null;
+  if (id) {
+    hit = catalog.find(function(a) { return a.id && a.id === id && (!issueKey || a.issueKey === issueKey); });
+    if (hit) return hit;
+  }
+  if (filename) {
+    hit = catalog.find(function(a) { return a.filename && a.filename === filename && (!issueKey || a.issueKey === issueKey); });
+  }
+  return hit || null;
+}
+
+function getAttachmentExtension(fileName) {
+  const name = String(fileName || '').toLowerCase().trim();
+  const dot = name.lastIndexOf('.');
+  if (dot < 0) return '';
+  return name.slice(dot);
+}
+
+function isLikelyBinaryGibberish(text) {
+  const s = String(text || '');
+  if (!s) return false;
+
+  if (/^PK\x03\x04/.test(s)) return true;
+
+  let bad = 0;
+  const len = s.length;
+  const inspectLen = len > 12000 ? 12000 : len;
+  for (let i = 0; i < inspectLen; i++) {
+    const c = s.charCodeAt(i);
+    const isControl = (c < 32 && c !== 9 && c !== 10 && c !== 13);
+    if (isControl || c === 65533) bad++;
+  }
+  return inspectLen > 0 && (bad / inspectLen) > 0.02;
+}
+
+async function fetchAttachmentText(attachment, mergedEnv) {
+  const url = String(attachment && attachment.contentUrl || '').trim();
+  const filename = String(attachment && attachment.filename || '').trim();
+  const mimeType = String(attachment && attachment.mimeType || '').trim();
+  const ext = getAttachmentExtension(filename);
+
+  if (!url) {
+    return { status: 'skipped', reason: 'missing-url', text: '' };
+  }
+  if (!isLikelyTextAttachment(filename, mimeType)) {
+    return { status: 'skipped', reason: 'unsupported-type', text: '' };
+  }
+
+  const authHeaders = resolveAtlassianAuth(mergedEnv);
+  if (!authHeaders) {
+    return { status: 'skipped', reason: 'missing-auth', text: '' };
+  }
+
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: Object.assign({ Accept: 'text/plain,application/json,text/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,*/*' }, authHeaders)
+  });
+
+  if (!res.ok) {
+    return { status: 'failed', reason: 'http-' + res.status, text: '' };
+  }
+
+  const arrayBuffer = await res.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer || new ArrayBuffer(0));
+
+  let text = '';
+
+  const isDocx = ext === '.docx' || /officedocument|wordprocessingml|msword/i.test(mimeType);
+  const isPdf = ext === '.pdf' || /pdf/i.test(mimeType);
+
+  if (isDocx) {
+    if (!mammoth) {
+      return { status: 'skipped', reason: 'docx-parser-missing', text: '' };
+    }
+    try {
+      const result = await mammoth.extractRawText({ buffer: buffer });
+      text = String((result && result.value) || '');
+    } catch (_) {
+      return { status: 'failed', reason: 'docx-parse-failed', text: '' };
+    }
+  } else if (isPdf) {
+    if (!pdfParse) {
+      return { status: 'skipped', reason: 'pdf-parser-missing', text: '' };
+    }
+    try {
+      const result = await pdfParse(buffer);
+      text = String((result && result.text) || '');
+    } catch (_) {
+      return { status: 'failed', reason: 'pdf-parse-failed', text: '' };
+    }
+  } else {
+    text = buffer.toString('utf8');
+  }
+
+  if (typeof text !== 'string') text = '';
+  text = text.replace(/\u0000/g, '').trim();
+
+  if (isLikelyBinaryGibberish(text)) {
+    return { status: 'skipped', reason: 'binary-content', text: '' };
+  }
+
+  if (!text) {
+    return { status: 'skipped', reason: 'empty-content', text: '' };
+  }
+
+  // Keep the evidence bounded so large files do not bloat the DoR payload.
+  const capped = text.length > 200000 ? text.slice(0, 200000) : text;
+  return { status: 'ok', reason: '', text: capped };
+}
+
+async function collectSelectedAttachmentEvidence(selectedAttachments, fetched, mergedEnv) {
+  const selected = Array.isArray(selectedAttachments)
+    ? selectedAttachments.filter(function(a) { return a && a.include !== false; })
+    : [];
+
+  const catalog = buildAttachmentCatalogFromFetched(fetched);
+  const snippets = [];
+  const extracted = [];
+  const skipped = [];
+  const failed = [];
+
+  for (const chosen of selected) {
+    const mapped = findAttachmentInCatalog(chosen, catalog) || {
+      issueKey: String(chosen.issueKey || ''),
+      id: String(chosen.id || ''),
+      filename: String(chosen.filename || ''),
+      contentUrl: String(chosen.contentUrl || ''),
+      mimeType: String(chosen.mimeType || '')
+    };
+
+    const result = await fetchAttachmentText(mapped, mergedEnv);
+    const label = (mapped.issueKey ? mapped.issueKey + ' | ' : '') + (mapped.filename || mapped.id || 'onbekende-bijlage');
+
+    if (result.status === 'ok') {
+      snippets.push('Attachment ' + label + '\n' + result.text);
+      extracted.push({ label: label });
+    } else if (result.status === 'skipped') {
+      skipped.push({ label: label, reason: result.reason });
+    } else {
+      failed.push({ label: label, reason: result.reason });
+    }
+  }
+
+  return {
+    selectedCount: selected.length,
+    extractedCount: snippets.length,
+    extracted: extracted,
+    skipped: skipped,
+    failed: failed,
+    snippets: snippets
+  };
+}
+
+function extractAdfTextForChecks(node) {
+  if (!node) return '';
+  if (typeof node === 'string') return node;
+  if (Array.isArray(node)) return node.map(extractAdfTextForChecks).filter(Boolean).join('');
+  if (typeof node !== 'object') return '';
+
+  if (node.type === 'text') return String(node.text || '');
+
+  const content = Array.isArray(node.content) ? node.content : [];
+  const inner = content.map(extractAdfTextForChecks).join('');
+  if (node.type === 'paragraph' || node.type === 'heading' || node.type === 'listItem') return inner + '\n';
+  if (node.type === 'hardBreak') return '\n';
+  return inner;
+}
+
+function getIssueDescriptionForChecks(issue) {
+  if (!issue || !issue.fields || typeof issue.fields !== 'object') return '';
+  const d = issue.fields.description;
+  if (!d) return '';
+  if (typeof d === 'string') return d.trim();
+  if (typeof d === 'object') return extractAdfTextForChecks(d).replace(/\n{3,}/g, '\n\n').trim();
+  return '';
+}
+
+function pickRootIssueForChecks(data) {
+  if (!data || typeof data !== 'object') return null;
+  if (data.issue && typeof data.issue === 'object') return data.issue;
+  if (data.rootIssue && typeof data.rootIssue === 'object') return data.rootIssue;
+  if (data.jiraIssue && typeof data.jiraIssue === 'object') return data.jiraIssue;
+  if (data.key || data.fields) return data;
+  return null;
+}
+
+function pickChildIssuesForChecks(data) {
+  if (!data || typeof data !== 'object') return [];
+  if (Array.isArray(data.childIssues)) return data.childIssues.filter(function(x) { return x && typeof x === 'object'; });
+  if (Array.isArray(data.subIssues)) return data.subIssues.filter(function(x) { return x && typeof x === 'object'; });
+  if (Array.isArray(data.underlyingIssues)) return data.underlyingIssues.filter(function(x) { return x && typeof x === 'object'; });
+  return [];
+}
+
+function buildHarvestMetaFromFetched(fetched) {
+  const root = pickRootIssueForChecks(fetched) || {};
+  const children = pickChildIssuesForChecks(fetched);
+
+  const rootUpdated = root && root.fields && typeof root.fields === 'object'
+    ? String(root.fields.updated || '').trim()
+    : '';
+
+  const childMap = {};
+  children.forEach(function(issue) {
+    const key = getIssueKeyForSummary(issue);
+    const updated = issue && issue.fields && typeof issue.fields === 'object'
+      ? String(issue.fields.updated || '').trim()
+      : '';
+    if (!key || !updated) return;
+    childMap[key] = updated;
+  });
+
+  return {
+    harvestedAt: new Date().toISOString(),
+    jiraUpdated: rootUpdated,
+    children: childMap
+  };
+}
+
+async function buildDorCheckFromFetched(fetched, selectedAttachments, mergedEnv) {
+  const root = pickRootIssueForChecks(fetched) || {};
+  const children = pickChildIssuesForChecks(fetched);
+  const descriptions = [root].concat(children).map(getIssueDescriptionForChecks).filter(Boolean);
+  const attachmentEvidence = await collectSelectedAttachmentEvidence(selectedAttachments, fetched, mergedEnv);
+  const fullText = descriptions.concat(attachmentEvidence.snippets || []).join('\n\n').toLowerCase();
+
+  function hasAny(patterns) {
+    return patterns.some(function(p) { return p.test(fullText); });
+  }
+
+  const items = [];
+
+  const stableOk = hasAny([/functioneel/, /stabiel/, /werkt\s+correct/, /goedgekeurd/, /accepted/, /ready\s+for\s+test/i]);
+  items.push({
+    id: 'dor-functional-stability',
+    labelNl: 'Functional Stability',
+    status: stableOk ? 'ok' : 'warning',
+    notes: stableOk
+      ? 'Indicaties van functionele stabiliteit gevonden in Jira-beschrijving.'
+      : 'Geen harde bevestiging van functionele stabiliteit gevonden in de huidige Jira-gegevens.'
+  });
+
+  const acceptanceCriteriaPresent = hasAny([
+    /acceptatie\s*criteria/,
+    /acceptance\s*criteria/,
+    /\bac\b\s*:/,
+    /\bcriteria\b/,
+    /\brequirements?\b/,
+    /\bmust\b/,
+    /\bshall\b/
+  ]);
+  const gherkinOk = hasAny([/\bgiven\b/, /\bwhen\b/, /\bthen\b/]);
+
+  let acceptanceStatus = 'warning';
+  if (acceptanceCriteriaPresent && gherkinOk) acceptanceStatus = 'ok';
+
+  items.push({
+    id: 'dor-acceptance-criteria',
+    labelNl: 'Acceptatie Criteria',
+    status: acceptanceStatus,
+    notes: 'Aanwezigheid: '
+      + (acceptanceCriteriaPresent ? 'OK' : 'Ontbreekt')
+      + '\nFormat (Given/When/Then): '
+      + (gherkinOk ? 'OK' : 'Ontbreekt')
+  });
+
+  const testDataOk = hasAny([/test\s*data/, /testdata/, /dataset/, /records?/, /gebruikers?/, /users?/, /rollen?/, /roles?/]);
+  items.push({
+    id: 'dor-test-data',
+    labelNl: 'Test Data',
+    status: testDataOk ? 'ok' : 'warning',
+    notes: testDataOk
+      ? 'Verwijzingen naar testdata/dataset gevonden.'
+      : 'Geen duidelijke testdata- of datasetinformatie gevonden.'
+  });
+
+  const accessOk = hasAny([/\biam\b/, /permissions?/, /toegang/, /authorisatie/, /autorisatie/, /rechten/, /roles?/]);
+  items.push({
+    id: 'dor-access',
+    labelNl: 'Access / IAM',
+    status: accessOk ? 'ok' : 'warning',
+    notes: accessOk
+      ? 'Toegangs- of IAM-informatie gevonden.'
+      : 'Geen expliciete toegangs- of IAM-informatie gevonden.'
+  });
+
+  const allPassed = items.every(function(item) { return item.status === 'ok'; });
+
+  return {
+    checkedAt: new Date().toISOString(),
+    source: path.relative(WORKSPACE, dorDodInstructionsPath).replace(/\\/g, '/'),
+    sourceSection: 'Definition of Ready (DoR)',
+    evidence: {
+      descriptionsUsed: descriptions.length,
+      selectedAttachments: attachmentEvidence.selectedCount,
+      extractedAttachmentTexts: attachmentEvidence.extractedCount,
+      skippedAttachments: attachmentEvidence.skipped,
+      failedAttachments: attachmentEvidence.failed
+    },
+    items: items,
+    allPassed: allPassed
+  };
+}
+
+async function buildTestabilityCheckFromFetched(fetched, selectedAttachments, mergedEnv) {
+  const root = pickRootIssueForChecks(fetched) || {};
+  const children = pickChildIssuesForChecks(fetched);
+  const descriptions = [root].concat(children).map(getIssueDescriptionForChecks).filter(Boolean);
+  const attachmentEvidence = await collectSelectedAttachmentEvidence(selectedAttachments, fetched, mergedEnv);
+  const fullText = descriptions.concat(attachmentEvidence.snippets || []).join('\n\n').toLowerCase();
+
+  function hasAny(patterns) {
+    return patterns.some(function(p) { return p.test(fullText); });
+  }
+
+  const testBasisOk = hasAny([
+    /user\s*story/,
+    /acceptatie\s*criteria/,
+    /acceptance\s*criteria/,
+    /definition\s*of\s*ready/,
+    /\bdor\b/,
+    /definition\s*of\s*done/,
+    /\bdod\b/,
+    /refinement/,
+    /requirements?/
+  ]);
+
+  const verifiableOutcomeOk = hasAny([
+    /expected/,
+    /verwacht/,
+    /resultaat/,
+    /assert/,
+    /controle/,
+    /validat/,
+    /status/,
+    /melding/,
+    /output/
+  ]);
+
+  const testDataOk = hasAny([
+    /test\s*data/,
+    /testdata/,
+    /dataset/,
+    /records?/,
+    /gebruikers?/,
+    /users?/,
+    /rollen?/,
+    /roles?/
+  ]);
+
+  const riskPriorityOk = hasAny([
+    /risico/,
+    /risk/,
+    /prioriteit/,
+    /priority/,
+    /\bhigh\b/,
+    /\bmedium\b/,
+    /\blow\b/
+  ]);
+
+  const items = [];
+  items.push({
+    id: 'testability-basis',
+    labelNl: 'Testbasis aanwezig',
+    status: testBasisOk ? 'ok' : 'warning',
+    notes: testBasisOk
+      ? 'Er is een testbasis herkend (bijv. user story, acceptance criteria, DoR/DoD of refinement-notes).'
+      : 'Geen duidelijke testbasis gevonden (user story, acceptance criteria, DoR/DoD of refinement-notes).'
+  });
+  items.push({
+    id: 'testability-verifiable-outcome',
+    labelNl: 'Verifieerbare uitkomst',
+    status: verifiableOutcomeOk ? 'ok' : 'warning',
+    notes: verifiableOutcomeOk
+      ? 'Er zijn verifieerbare verwachte uitkomsten/herkenbare assertions gevonden.'
+      : 'Onvoldoende verifieerbare verwachte uitkomsten gevonden.'
+  });
+  items.push({
+    id: 'testability-data',
+    labelNl: 'Testdata benoemd',
+    status: testDataOk ? 'ok' : 'warning',
+    notes: testDataOk
+      ? 'Er zijn aanwijzingen voor benodigde testdata gevonden.'
+      : 'Geen duidelijke testdata-informatie gevonden.'
+  });
+  items.push({
+    id: 'testability-risk-priority',
+    labelNl: 'Risico/Prioriteit context',
+    status: riskPriorityOk ? 'ok' : 'warning',
+    notes: riskPriorityOk
+      ? 'Risico- of prioriteitscontext is aanwezig voor testfocus.'
+      : 'Geen expliciete risico- of prioriteitscontext gevonden.'
+  });
+
+  const isTestable = testBasisOk && verifiableOutcomeOk && testDataOk;
+
+  return {
+    checkedAt: new Date().toISOString(),
+    source: path.relative(WORKSPACE, testIstqbInstructionsPath).replace(/\\/g, '/'),
+    sourceSection: 'ISTQB testability pre-check',
+    evidence: {
+      descriptionsUsed: descriptions.length,
+      selectedAttachments: attachmentEvidence.selectedCount,
+      extractedAttachmentTexts: attachmentEvidence.extractedCount,
+      skippedAttachments: attachmentEvidence.skipped,
+      failedAttachments: attachmentEvidence.failed
+    },
+    items: items,
+    isTestable: isTestable
+  };
+}
+
+function getIssueKeyForSummary(issue) {
+  if (!issue || typeof issue !== 'object') return '';
+  return String(issue.key || issue.issueKey || issue.id || '').trim();
+}
+
+function getIssueTitleForSummary(issue) {
+  if (!issue || typeof issue !== 'object') return '';
+  if (issue.fields && typeof issue.fields === 'object') {
+    return String(issue.fields.summary || '').trim();
+  }
+  return String(issue.summary || issue.title || '').trim();
+}
+
+function getIssueCommentsForSummary(issue) {
+  const out = [];
+  if (!issue || !issue.fields || typeof issue.fields !== 'object') return out;
+  const c = issue.fields.comment;
+  if (!c || typeof c !== 'object') return out;
+  const comments = Array.isArray(c.comments) ? c.comments : [];
+  comments.forEach(function(item) {
+    if (!item || typeof item !== 'object') return;
+    const author = item.author && typeof item.author === 'object'
+      ? String(item.author.displayName || item.author.name || item.author.emailAddress || '').trim()
+      : '';
+    const created = String(item.created || '').trim();
+    const body = item.body;
+    let text = '';
+    if (typeof body === 'string') text = body.trim();
+    else if (body && typeof body === 'object') text = extractAdfTextForChecks(body).replace(/\n{3,}/g, '\n\n').trim();
+    if (!text) return;
+    out.push({ author: author, created: created, text: text });
+  });
+  return out;
+}
+
+function isLikelyImageAttachment(fileName, mimeType) {
+  const name = String(fileName || '').toLowerCase();
+  const mime = String(mimeType || '').toLowerCase();
+  if (mime.startsWith('image/')) return true;
+  return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(name);
+}
+
+function truncateForSummary(text, maxLen) {
+  const s = String(text || '');
+  if (s.length <= maxLen) return s;
+  return s.slice(0, maxLen) + '...';
+}
+
+async function generateSummaryMarkdownFromFetched(fetched, answers, dorData, testabilityData, mergedEnv) {
+  const root = pickRootIssueForChecks(fetched) || {};
+  const children = pickChildIssuesForChecks(fetched);
+  const allIssues = [root].concat(children);
+
+  const rootKey = getIssueKeyForSummary(root) || String((answers && answers.jiraKey) || '').trim() || 'ONBEKEND';
+  const rootTitle = getIssueTitleForSummary(root) || 'Jira item';
+  const now = new Date();
+  const generatedAt = now.toLocaleString('nl-NL', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  });
+
+  const selectedAttachments = Array.isArray(answers && answers.selectedAttachments)
+    ? answers.selectedAttachments.filter(function(a) { return a && a.include !== false; })
+    : [];
+
+  const attachmentCatalog = buildAttachmentCatalogFromFetched(fetched);
+  const mappedSelectedAttachments = selectedAttachments.map(function(sel) {
+    const mapped = findAttachmentInCatalog(sel, attachmentCatalog) || {};
+    return {
+      include: true,
+      issueKey: String(mapped.issueKey || sel.issueKey || '').trim(),
+      id: String(mapped.id || sel.id || '').trim(),
+      filename: String(mapped.filename || sel.filename || '').trim(),
+      contentUrl: String(mapped.contentUrl || sel.contentUrl || '').trim(),
+      mimeType: String(mapped.mimeType || sel.mimeType || '').trim()
+    };
+  });
+
+  const attachmentEvidence = await collectSelectedAttachmentEvidence(mappedSelectedAttachments, fetched, mergedEnv);
+
+  function normalizeText(s) {
+    return String(s || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function splitNoteLines(note, fallback) {
+    var raw = String(note || fallback || '').replace(/\r\n/g, '\n');
+    return raw
+      .split(/\n+/)
+      .map(function(line) { return normalizeText(line); })
+      .filter(Boolean);
+  }
+
+  function splitIntoSentences(text) {
+    return String(text || '')
+      .split(/(?<=[.!?])\s+|\n+/)
+      .map(function(s) { return normalizeText(s); })
+      .filter(function(s) { return s.length >= 25; });
+  }
+
+  function scoreSentence(sentence) {
+    var s = String(sentence || '').toLowerCase();
+    var score = 0;
+    var signals = [
+      /acceptatie|acceptance|given|when|then/,
+      /risico|risk|impact|prioriteit|priority/,
+      /testdata|dataset|record|user|rol|role/,
+      /verwacht|expected|resultaat|assert|validat|controle/,
+      /fout|error|probleem|issue|blokker|blocker/,
+      /scope|afhankelijk|dependency|randvoorwaarde|voorwaarde/
+    ];
+    signals.forEach(function(rx) { if (rx.test(s)) score += 2; });
+    if (s.length >= 80) score += 1;
+    if (s.length >= 140) score += 1;
+    return score;
+  }
+
+  function takeTopSentencesFromTexts(texts, maxItems) {
+    var bag = [];
+    var seen = new Set();
+    (texts || []).forEach(function(t) {
+      splitIntoSentences(t).forEach(function(sentence) {
+        var key = sentence.toLowerCase();
+        if (seen.has(key)) return;
+        seen.add(key);
+        bag.push({ sentence: sentence, score: scoreSentence(sentence) });
+      });
+    });
+
+    bag.sort(function(a, b) { return b.score - a.score; });
+    return bag.slice(0, maxItems).map(function(x) { return x.sentence; });
+  }
+
+  function takeTopSentencesByTheme(texts, themeRegexes, maxItems) {
+    var bag = [];
+    var seen = new Set();
+    (texts || []).forEach(function(t) {
+      splitIntoSentences(t).forEach(function(sentence) {
+        var lower = sentence.toLowerCase();
+        var key = lower;
+        if (seen.has(key)) return;
+        var hit = themeRegexes.some(function(rx) { return rx.test(lower); });
+        if (!hit) return;
+        seen.add(key);
+        bag.push({ sentence: sentence, score: scoreSentence(sentence) + 2 });
+      });
+    });
+    bag.sort(function(a, b) { return b.score - a.score; });
+    return bag.slice(0, maxItems).map(function(x) { return x.sentence; });
+  }
+
+  const lines = [];
+  lines.push('# ' + rootKey + ' — ' + rootTitle);
+  lines.push('');
+  lines.push('## Status');
+  lines.push('**Aangemaakt:** ' + generatedAt);
+  lines.push('');
+
+  lines.push('## Pre-check aandachtspunten (niet voldaan)');
+  const dorFailed = (dorData && Array.isArray(dorData.items) ? dorData.items : []).filter(function(i) { return (i.status || 'warning') !== 'ok'; });
+  const testFailed = (testabilityData && Array.isArray(testabilityData.items) ? testabilityData.items : []).filter(function(i) { return (i.status || 'warning') !== 'ok'; });
+  if (!dorFailed.length && !testFailed.length) {
+    lines.push('Geen afwijkingen vastgesteld in DoR en Testbaarheid checks.');
+  } else {
+    dorFailed.forEach(function(item) {
+      lines.push('[DoR] ' + String(item.labelNl || item.label || 'Onbekend criterium') + ':');
+      splitNoteLines(item.notes, 'Niet voldaan.').forEach(function(line) {
+        lines.push('\t• ' + line);
+      });
+    });
+    testFailed.forEach(function(item) {
+      lines.push('[Testbaarheid] ' + String(item.labelNl || item.label || 'Onbekend criterium') + ':');
+      splitNoteLines(item.notes, 'Niet voldaan.').forEach(function(line) {
+        lines.push('\t• ' + line);
+      });
+    });
+    if (testabilityData && testabilityData.isTestable === false) {
+      lines.push('[Testbaarheid] Overkoepelend oordeel:');
+      lines.push('\t• item is momenteel niet voldoende testbaar.');
+    }
+  }
+  lines.push('');
+
+  lines.push('## Jira items overzicht');
+  lines.push('- Root item: ' + rootKey + ' - ' + rootTitle);
+  if (!children.length) {
+    lines.push('- Sub-items: geen.');
+  } else {
+    children.forEach(function(issue) {
+      const k = getIssueKeyForSummary(issue) || 'Onbekend';
+      const t = getIssueTitleForSummary(issue) || 'Zonder titel';
+      lines.push('- Sub-item: ' + k + ' - ' + t);
+    });
+  }
+  lines.push('');
+
+  var descriptionTexts = [];
+  allIssues.forEach(function(issue) {
+    var d = getIssueDescriptionForChecks(issue);
+    if (d) descriptionTexts.push(d);
+  });
+
+  var commentTexts = [];
+  var totalComments = 0;
+  allIssues.forEach(function(issue) {
+    const k = getIssueKeyForSummary(issue) || 'Onbekend';
+    const comments = getIssueCommentsForSummary(issue);
+    totalComments += comments.length;
+    comments.forEach(function(c) {
+      const meta = [k, c.author || 'Onbekende auteur', c.created || 'onbekende datum'].join(' | ');
+      commentTexts.push(meta + '. ' + c.text);
+    });
+  });
+
+  var overallCorpus = [];
+  descriptionTexts.forEach(function(t) { overallCorpus.push(t); });
+  commentTexts.forEach(function(t) { overallCorpus.push(t); });
+  (attachmentEvidence.snippets || []).forEach(function(t) { overallCorpus.push(t); });
+
+  lines.push('## Overkoepelende samenvatting');
+  if (!overallCorpus.length) {
+    lines.push('- Geen inhoud beschikbaar om een samenvatting op te bouwen.');
+  } else {
+    var overallTop = takeTopSentencesFromTexts(overallCorpus, 24);
+    if (!overallTop.length) {
+      lines.push('- Broninhoud aanwezig, maar geen duidelijke kernzinnen gevonden.');
+    } else {
+      overallTop.forEach(function(sentence) {
+        lines.push('- ' + sentence);
+      });
+    }
+
+    var testGoalSignals = takeTopSentencesByTheme(overallCorpus, [
+      /doel|scope|proces|stap|flow|functionaliteit|feature|user\s*story|epic|story/,
+      /acceptatie|acceptance|given|when|then|verwacht|expected|resultaat/
+    ], 8);
+    lines.push('');
+    lines.push('### Verdieping voor testontwerp');
+    if (testGoalSignals.length) {
+      lines.push('- Doel en scope-signalen:');
+      testGoalSignals.forEach(function(s) { lines.push('  - ' + s); });
+    } else {
+      lines.push('- Doel en scope-signalen: geen expliciete signalen gevonden.');
+    }
+
+    var testDataSignals = takeTopSentencesByTheme(overallCorpus, [
+      /test\s*data|testdata|dataset|record|gebruikers?|users?|rollen?|roles?|iam|rechten|permission|toegang/
+    ], 8);
+    if (testDataSignals.length) {
+      lines.push('- Testdata en toegang:');
+      testDataSignals.forEach(function(s) { lines.push('  - ' + s); });
+    } else {
+      lines.push('- Testdata en toegang: niet expliciet uitgewerkt in de beschikbare bronnen.');
+    }
+
+    var riskSignals = takeTopSentencesByTheme(overallCorpus, [
+      /risico|risk|impact|blokker|blocker|fout|error|afhankelijk|dependency|randvoorwaarde|constraint|beperking/
+    ], 8);
+    if (riskSignals.length) {
+      lines.push('- Risico\'s en afhankelijkheden:');
+      riskSignals.forEach(function(s) { lines.push('  - ' + s); });
+    } else {
+      lines.push('- Risico\'s en afhankelijkheden: geen expliciete signalen gevonden.');
+    }
+
+  }
+  lines.push('');
+
+  lines.push('## Brondekking');
+  lines.push('- Beschrijvingen gebruikt: ' + String(descriptionTexts.length));
+  lines.push('- Opmerkingen gebruikt: ' + String(totalComments));
+  lines.push('- Geselecteerde bijlagen: ' + String(mappedSelectedAttachments.length));
+  lines.push('- Bijlagen met tekstextract: ' + String(attachmentEvidence.extractedCount || 0));
+  if (attachmentEvidence.extracted && attachmentEvidence.extracted.length) {
+    lines.push('- Verwerkte bijlagen:');
+    attachmentEvidence.extracted.forEach(function(x) {
+      lines.push('  - ' + String(x.label || 'onbekende bijlage'));
+    });
+  }
+  if (attachmentEvidence.skipped && attachmentEvidence.skipped.length) {
+    lines.push('- Overgeslagen bijlagen:');
+    attachmentEvidence.skipped.forEach(function(s) {
+      lines.push('  - ' + String(s.label || 'onbekende bijlage') + ' | reden: ' + String(s.reason || 'onbekend'));
+    });
+  }
+  if (attachmentEvidence.skipped && attachmentEvidence.skipped.length) {
+    var skippedImageCount = attachmentEvidence.skipped.filter(function(s) {
+      return /unsupported-type/.test(String(s.reason || ''));
+    }).length;
+    if (skippedImageCount) {
+      lines.push('- Let op: een deel van de overgeslagen bijlagen heeft geen direct tekstextract (bijv. afbeelding of niet-ondersteund type).');
+    }
+  }
+  if (attachmentEvidence.failed && attachmentEvidence.failed.length) {
+    lines.push('- Mislukte bijlageverwerking:');
+    attachmentEvidence.failed.forEach(function(f) {
+      lines.push('  - ' + String(f.label || 'onbekende bijlage') + ' | fout: ' + String(f.reason || 'onbekend'));
+    });
+  }
+  lines.push('');
+
+  return lines.join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
@@ -1156,6 +1975,7 @@ const server = http.createServer(async function(req, res) {
     if (fs.existsSync(fetchedPath))          fs.unlinkSync(fetchedPath);
     if (fs.existsSync(fetchErrorPath))       fs.unlinkSync(fetchErrorPath);
     if (fs.existsSync(summaryPath))          fs.unlinkSync(summaryPath);
+    if (fs.existsSync(summaryConfirmedPath)) fs.unlinkSync(summaryConfirmedPath);
     if (fs.existsSync(dorCheckPath))         fs.unlinkSync(dorCheckPath);
     if (fs.existsSync(testabilityCheckPath)) fs.unlinkSync(testabilityCheckPath);
 
@@ -1285,50 +2105,79 @@ const server = http.createServer(async function(req, res) {
     return;
   }
 
-  // ── DoR check — renders jira-dor-check.json as a checklist ───────────────
-  if (url === '/dor-check') {
+  // ── Pre-check — renders DoR + testability checks ─────────────────────────
+  if (url === '/pre-check' || url === '/dor-check') {
     var dorData = { items: [], allPassed: false };
     try { dorData = JSON.parse(fs.readFileSync(dorCheckPath, 'utf8')); } catch (_) {
       res.writeHead(302, { Location: '/working' }); res.end(); return;
     }
 
+    var testabilityData = { items: [], isTestable: false };
+    var testabilityKnown = false;
+    try {
+      testabilityData = JSON.parse(fs.readFileSync(testabilityCheckPath, 'utf8'));
+      testabilityKnown = true;
+    } catch (_) {}
+
     var iconMap = { ok: '&#10003;', warning: '&#9888;', fail: '&#10007;' };
     var colorMap = { ok: '#36b37e', warning: '#ff991f', fail: '#de350b' };
     var bgMap    = { ok: '#f0faf4', warning: '#fffbe6', fail: '#fff0ee' };
 
-    var itemsHtml = '';
-    (dorData.items || []).forEach(function(item) {
-      var st = item.status || 'warning';
-      var icon = iconMap[st] || '?';
-      var color = colorMap[st] || '#888';
-      var bg = bgMap[st] || '#fff';
-      itemsHtml += '<div style="display:flex;align-items:flex-start;gap:14px;padding:14px 16px;'
-        + 'background:' + bg + ';border:1px solid #dde;border-left:4px solid ' + color + ';'
-        + 'border-radius:8px;margin-bottom:10px;">'
-        + '<span style="font-size:1.3rem;color:' + color + ';flex-shrink:0;margin-top:1px;">' + icon + '</span>'
-        + '<div><div style="font-weight:700;color:#1a1a1a;margin-bottom:3px;">'
-        + escHtml(item.labelNl || item.label || '') + '</div>'
-        + '<div style="color:#555;font-size:.9rem;">' + escHtml(item.notes || '') + '</div>'
-        + '</div></div>\n';
-    });
+    function renderItems(items) {
+      var html = '';
+      (items || []).forEach(function(item) {
+        var st = item.status || 'warning';
+        var icon = iconMap[st] || '?';
+        var color = colorMap[st] || '#888';
+        var bg = bgMap[st] || '#fff';
+        var noteHtml = escHtml(item.notes || '').replace(/\n/g, '<br>');
+        html += '<div style="display:flex;align-items:flex-start;gap:14px;padding:14px 16px;'
+          + 'background:' + bg + ';border:1px solid #dde;border-left:4px solid ' + color + ';'
+          + 'border-radius:8px;margin-bottom:10px;">'
+          + '<span style="font-size:1.3rem;color:' + color + ';flex-shrink:0;margin-top:1px;">' + icon + '</span>'
+          + '<div><div style="font-weight:700;color:#1a1a1a;margin-bottom:3px;">'
+          + escHtml(item.labelNl || item.label || '') + '</div>'
+          + '<div style="color:#555;font-size:.9rem;">' + noteHtml + '</div>'
+          + '</div></div>\n';
+      });
+      return html;
+    }
 
-    var warningBanner = '';
+    var dorItemsHtml = renderItems(dorData.items || []);
+    var testabilityItemsHtml = renderItems(testabilityData.items || []);
+
+    var dorWarningBanner = '';
     if (!dorData.allPassed) {
-      warningBanner = '<div style="background:#fffbe6;border:1px solid #ffe58f;border-radius:8px;'
+      dorWarningBanner = '<div style="background:#fffbe6;border:1px solid #ffe58f;border-radius:8px;'
         + 'padding:12px 16px;margin-bottom:20px;color:#7c5914;font-size:.9rem;">'
         + '&#9888;&nbsp; Niet alle DoR-criteria zijn aantoonbaar vervuld. '
         + 'Je kunt toch doorgaan, maar wees je bewust van de risico\'s.</div>';
     }
+
+    var testabilityWarningBanner = '';
+    if (!testabilityKnown || !testabilityData.isTestable) {
+      testabilityWarningBanner = '<div style="background:#fffbe6;border:1px solid #ffe58f;border-radius:8px;'
+        + 'padding:12px 16px;margin-bottom:20px;color:#7c5914;font-size:.9rem;">'
+        + '&#9888;&nbsp; Dit item is (nog) niet voldoende testbaar op basis van de huidige input. '
+        + 'Vul ontbrekende informatie aan voordat je testcases opstelt.'
+        + (!testabilityKnown ? '<div style="margin-top:8px;color:#6b778c;font-size:.88rem;">Testability-checkbestand ontbreekt; waarschuwing wordt uit voorzorg getoond.</div>' : '')
+        + '</div>';
+    }
+
+    var itemsHtml = '';
+    itemsHtml += '<h3 style="margin:4px 0 10px;color:#172b4d;font-size:1.05rem;">DoR check</h3>';
+    itemsHtml += dorWarningBanner + dorItemsHtml;
+    itemsHtml += '<h3 style="margin:22px 0 10px;color:#172b4d;font-size:1.05rem;">Testbaarheid check</h3>';
+    itemsHtml += testabilityWarningBanner + testabilityItemsHtml;
 
     var logoHtml = '<img src="' + LOGO + '" class="logo" alt="Logo" style="height:auto;max-height:60px;width:auto;margin-right:16px;">';
     var html = '<!DOCTYPE html><html lang="nl" translate="no"><head>'
       + '<meta charset="UTF-8"><style>' + SUMMARY_CSS + '</style></head><body>'
       + '<div class="top-header">' + logoHtml
       + '<div class="issue-header">'
-      + '<span class="issue-title">Definition of Ready \u2014 Controle</span>'
+      + '<span class="issue-title">Pre-check \u2014 DoR en Testbaarheid</span>'
       + '</div></div>'
       + '<div style="padding:8px 0 100px">'
-      + warningBanner
       + itemsHtml
       + '</div>'
       + '<div class="actions">'
@@ -1339,15 +2188,37 @@ const server = http.createServer(async function(req, res) {
       + 'function bevestig(){'
       + '  document.getElementById("btnOk").disabled=true;'
       + '  document.getElementById("btnOk").textContent="Bezig\u2026";'
-      + '  fetch("/confirm-dor",{method:"POST"}).then(function(){location.href="/working-summary";});'
+      + '  fetch("/confirm-precheck",{method:"POST"}).then(function(){location.href="/working-summary";});'
       + '}'
       + '<\/script>'
       + '</body></html>';
     return send(res, 200, 'text/html', html);
   }
 
-  // ── User acknowledges DoR check ───────────────────────────────────────────
-  if (url === '/confirm-dor' && req.method === 'POST') {
+  // ── User acknowledges pre-check (DoR + testability) ─────────────────────
+  if ((url === '/confirm-precheck' || url === '/confirm-dor') && req.method === 'POST') {
+    let fetched = {};
+    let answers = {};
+    let dorData = { items: [], allPassed: false };
+    let testabilityData = { items: [], isTestable: false };
+    try { fetched = JSON.parse(fs.readFileSync(fetchedPath, 'utf8')); } catch (_) {}
+    try { answers = JSON.parse(fs.readFileSync(answersPath, 'utf8')); } catch (_) {}
+    try { dorData = JSON.parse(fs.readFileSync(dorCheckPath, 'utf8')); } catch (_) {}
+    try { testabilityData = JSON.parse(fs.readFileSync(testabilityCheckPath, 'utf8')); } catch (_) {}
+
+    const health = getMcpConfigHealth();
+    const launch = health.launch;
+    launch.mergedEnv = buildMcpEnv(launch.env);
+
+    const summaryMd = await generateSummaryMarkdownFromFetched(
+      fetched,
+      answers,
+      dorData,
+      testabilityData,
+      launch.mergedEnv
+    );
+    fs.writeFileSync(summaryPath, summaryMd, 'utf8');
+
     console.log('RESULT:dor-ok');
     res.writeHead(200); res.end('ok');
     return;
@@ -1601,7 +2472,9 @@ const server = http.createServer(async function(req, res) {
           issueTitle: issueTitle,
           issueLabel: issueLabel,
           fileName: String((a && (a.filename || a.name)) || 'Onbekende bijlage'),
-          attachmentId: String((a && (a.id || a.attachmentId)) || '')
+          attachmentId: String((a && (a.id || a.attachmentId)) || ''),
+          contentUrl: String((a && (a.content || a.url)) || ''),
+          mimeType: String((a && (a.mimeType || a.mimetype)) || '')
         });
       }
     }
@@ -1614,6 +2487,8 @@ const server = http.createServer(async function(req, res) {
           + 'data-issue-key="' + escHtml(String(row.issueKey || '')) + '" '
           + 'data-issue-title="' + escHtml(String(row.issueTitle || '')) + '" '
           + 'data-id="' + escHtml(row.attachmentId) + '" '
+          + 'data-content-url="' + escHtml(String(row.contentUrl || '')) + '" '
+          + 'data-mime-type="' + escHtml(String(row.mimeType || '')) + '" '
           + 'data-filename="' + escHtml(row.fileName) + '">'
           + '<span>' + escHtml(row.issueLabel) + ' | ' + escHtml(row.fileName) + '</span>'
           + '</li>';
@@ -1655,6 +2530,8 @@ const server = http.createServer(async function(req, res) {
       + '      issueKey: el.getAttribute("data-issue-key") || "",'
       + '      issueTitle: el.getAttribute("data-issue-title") || "",'
       + '      id: el.getAttribute("data-id") || "",'
+      + '      contentUrl: el.getAttribute("data-content-url") || "",'
+      + '      mimeType: el.getAttribute("data-mime-type") || "",'
       + '      filename: el.getAttribute("data-filename") || "",'
       + '      include: !!el.checked'
       + '    };'
@@ -1663,10 +2540,10 @@ const server = http.createServer(async function(req, res) {
       + '    method: "POST",'
       + '    headers: {"Content-Type":"application/json"},'
       + '    body: JSON.stringify({ selectedAttachments: selected })'
-      + '  }).then(function(){'
-      + '    document.body.innerHTML=\'<div style="text-align:center;padding:80px 24px">\'+'
-      + '\'<h2 style="color:#0052cc">Jira-data bevestigd!</h2>\'+'
-      + '\'<p style="color:#666">Harvest fetch is afgerond. Je kunt nu terug naar VS Code.</p></div>\';'
+      + '  }).then(function(r){return r.json();}).then(function(r){'
+      + '    location.href=(r&&r.next)?r.next:"/pre-check";'
+      + '  }).catch(function(){'
+      + '    location.href="/pre-check";'
       + '  });'
       + '}'
       + '<\/script>'
@@ -1693,6 +2570,20 @@ const server = http.createServer(async function(req, res) {
     var logoHtml = '<img src="' + LOGO + '" class="logo" alt="Logo">';
     var bodyHtml = mdToHtmlSummary(md);
 
+    var confirmState = { confirmed: false };
+    try { confirmState = JSON.parse(fs.readFileSync(summaryConfirmedPath, 'utf8')); } catch (_) {}
+    var isConfirmed = !!(confirmState && confirmState.confirmed);
+    var confirmedAt = String(confirmState && confirmState.confirmedAt || '').trim();
+    var confirmedFile = String(confirmState && confirmState.savedFile || '').trim();
+    var confirmBanner = '';
+    if (isConfirmed) {
+      confirmBanner = '<div style="background:#f0faf4;border:1px solid #b7ebc6;border-radius:8px;'
+        + 'padding:12px 16px;margin-bottom:20px;color:#1f6f43;font-size:.9rem;">'
+        + '&#10003;&nbsp; Samenvatting opgeslagen op ' + escHtml(confirmedAt || 'onbekend tijdstip')
+        + (confirmedFile ? ('<br><span style="font-size:.82rem;color:#4b5;">Bestand: ' + escHtml(confirmedFile) + '</span>') : '')
+        + '</div>';
+    }
+
     // Unchanged banner — shown if the Analyse section states nothing changed since the last harvest
     var unchangedBanner = '';
     var unchangedMatch = md.match(/Geen wijzigingen vastgesteld sinds de vorige harvest op ([^.\n]+)\./);
@@ -1715,10 +2606,10 @@ const server = http.createServer(async function(req, res) {
       dorWarningHtml = '<div style="background:#fff0ee;border-left:5px solid #de350b;'
         + 'border-radius:6px;padding:14px 18px;margin-bottom:24px;">'
         + '<strong style="color:#de350b;font-size:1rem;">'
-        + '⚠️&nbsp; Dit item voldoet niet aan alle DoR/DoD-criteria. '
+        + '⚠️&nbsp; Dit item voldoet niet aan alle DoR-criteria. '
         + 'Controleer de vereisten voordat je verdergaat met het opstellen van testscripts.'
         + '</strong>'
-        + (!dorKnown ? '<div style="margin-top:8px;color:#6b778c;font-size:.88rem;">DoR/DoD-statusbestand ontbreekt; waarschuwing wordt uit voorzorg getoond.</div>' : '')
+        + (!dorKnown ? '<div style="margin-top:8px;color:#6b778c;font-size:.88rem;">DoR-statusbestand ontbreekt; waarschuwing wordt uit voorzorg getoond.</div>' : '')
         + '</div>';
     }
 
@@ -1752,18 +2643,28 @@ const server = http.createServer(async function(req, res) {
       + '</div>'
       + '</div>'
       + unchangedBanner
+        + confirmBanner
       + dorWarningHtml
       + testabilityWarningHtml
       + bodyHtml
       + '<div class="actions">'
-      + '<button class="btn" id="btnOk" onclick="bevestig()">Bevestigen</button>'
+        + (isConfirmed
+          ? '<button class="btn" id="btnContinue" onclick="doorgaan()">Doorgaan</button>'
+          : '<button class="btn" id="btnOk" onclick="bevestig()">Bevestigen</button>')
       + '<button type="button" class="btn btn-cancel" onclick="location.href=\'/cancel\'">Annuleren</button>'
       + '</div>'
       + '<script>'
       + 'function bevestig(){'
       + '  document.getElementById("btnOk").disabled=true;'
       + '  document.getElementById("btnOk").textContent="Bezig\u2026";'
-      + '  fetch("/bevestigen").then(function(){'
+        + '  fetch("/bevestigen").then(function(){'
+        + '    location.href="/summary";'
+        + '  });'
+        + '}'
+        + 'function doorgaan(){'
+        + '  var b=document.getElementById("btnContinue");'
+        + '  if(b){b.disabled=true;b.textContent="Bezig\u2026";}'
+        + '  fetch("/summary-continue",{method:"POST"}).then(function(){'
       + '    document.body.innerHTML=\'<div style="text-align:center;padding:80px 24px">\'+'
       + '\'<h2 style="color:#0052cc">Samenvatting bevestigd!</h2>\'+'
       + '\'<p style="color:#666">Harvest is afgerond. Je kunt nu terug naar VS Code.</p></div>\';'
@@ -1776,9 +2677,7 @@ const server = http.createServer(async function(req, res) {
 
   // ── User confirms the summary ─────────────────────────────────────────────
   if (url === '/bevestigen') {
-    fs.writeFileSync(actionPath, 'bevestigd', 'utf8');
-
-    // Re-write answers JSON with the harvest file path for downstream use.
+    // Re-write answers JSON with selected attachments and harvest file path for downstream use.
     let answers = {};
     try { answers = JSON.parse(fs.readFileSync(answersPath, 'utf8')); } catch (_) {}
     if (req.method === 'POST') {
@@ -1793,6 +2692,8 @@ const server = http.createServer(async function(req, res) {
                 issueKey: String(item && item.issueKey || ''),
                 issueTitle: String(item && item.issueTitle || ''),
                 id: String(item && item.id || ''),
+                contentUrl: String(item && item.contentUrl || ''),
+                mimeType: String(item && item.mimeType || ''),
                 filename: String(item && item.filename || ''),
                 include: !!(item && item.include)
               };
@@ -1800,15 +2701,77 @@ const server = http.createServer(async function(req, res) {
           }
         }
       } catch (_) {}
+
+      const confirmedKeyPost = answers.jiraKey || '';
+      if (confirmedKeyPost) {
+        answers.harvestFile = path.join(WORKSPACE, '01-Harvest-Jira-Summaries', 'harvest-' + confirmedKeyPost + '.md');
+      }
+      fs.writeFileSync(answersPath, JSON.stringify(answers, null, 2), 'utf8');
+
+      // Step 1 after Analyze: evaluate Jira input against Definition of Ready (DoR) guidance.
+      let fetched = {};
+      try { fetched = JSON.parse(fs.readFileSync(fetchedPath, 'utf8')); } catch (_) {}
+      const health = getMcpConfigHealth();
+      const launch = health.launch;
+      launch.mergedEnv = buildMcpEnv(launch.env);
+      const dorData = await buildDorCheckFromFetched(fetched, answers.selectedAttachments || [], launch.mergedEnv);
+      fs.writeFileSync(dorCheckPath, JSON.stringify(dorData, null, 2), 'utf8');
+      const testabilityData = await buildTestabilityCheckFromFetched(fetched, answers.selectedAttachments || [], launch.mergedEnv);
+      fs.writeFileSync(testabilityCheckPath, JSON.stringify(testabilityData, null, 2), 'utf8');
+
+      console.log('RESULT:analyse-started');
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, next: '/pre-check' }));
+      return;
     }
+
+    fs.writeFileSync(actionPath, 'bevestigd', 'utf8');
+
     const confirmedKey = answers.jiraKey || '';
+    const now = new Date();
+    const saveDisplay = buildSummaryTimestampForDisplay(now);
+    const summariesDir = path.join(WORKSPACE, '01-Harvest-Jira-Summaries');
+    const safeKey = confirmedKey || 'ONBEKEND';
+    const mdTargetFile = path.join(summariesDir, 'harvest-' + safeKey + '.md');
+    const metaTargetFile = path.join(summariesDir, 'harvest-' + safeKey + '.meta.json');
+
+    try { fs.mkdirSync(summariesDir, { recursive: true }); } catch (_) {}
+
+    let currentSummary = '';
+    try { currentSummary = fs.readFileSync(summaryPath, 'utf8'); } catch (_) { currentSummary = ''; }
+    fs.writeFileSync(mdTargetFile, currentSummary, 'utf8');
+
+    let fetched = {};
+    try { fetched = JSON.parse(fs.readFileSync(fetchedPath, 'utf8')); } catch (_) {}
+    const meta = buildHarvestMetaFromFetched(fetched);
+    fs.writeFileSync(metaTargetFile, JSON.stringify(meta, null, 2), 'utf8');
+
+    answers.harvestFile = mdTargetFile;
+    fs.writeFileSync(answersPath, JSON.stringify(answers, null, 2), 'utf8');
+
+    const relTarget = path.relative(WORKSPACE, mdTargetFile).replace(/\\/g, '/');
+    const confirmState = {
+      confirmed: true,
+      confirmedAt: saveDisplay,
+      savedFile: relTarget
+    };
+    fs.writeFileSync(summaryConfirmedPath, JSON.stringify(confirmState, null, 2), 'utf8');
+
     if (confirmedKey) {
-      answers.harvestFile = path.join(WORKSPACE, '01-Harvest-Jira-Summaries', 'Harvest-' + confirmedKey + '.md');
+      answers.harvestFile = mdTargetFile;
       fs.writeFileSync(answersPath, JSON.stringify(answers, null, 2), 'utf8');
     }
 
     console.log('CONFIRMED:ok');
 
+    res.writeHead(200); res.end('ok');
+    return;
+  }
+
+  if (url === '/summary-continue' && req.method === 'POST') {
+    fs.writeFileSync(actionPath, 'bevestigd', 'utf8');
+    console.log('RESULT:summary-continue');
     res.writeHead(200); res.end('ok');
     return;
   }
