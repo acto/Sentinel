@@ -115,3 +115,29 @@
 ## 2026-08-11 - v0.2.14
 - Updated `Scripts/Harvest-wizard.cjs` environment placeholder resolution so `${input:...}` values can resolve via Windows User environment variables when Process values are absent.
 - This prevents false `MCP-config nog niet compleet` warnings after setting `ATLASSIAN_BASE_URL`, `ATLASSIAN_EMAIL`, and `ATLASSIAN_API_TOKEN` at User scope.
+
+## 2026-08-11 - v0.2.24
+- Updated `Scripts/Harvest-wizard.cjs` to fetch sub-item issue data in addition to the root Jira item (MCP path and REST fallback path).
+- Extended fetch output payload (`jira-fetched.json`) with `childIssueKeys`, `childIssues`, and optional `childIssueErrors`.
+- Updated fetch-result UI to show a `Sub-items` section and include attachments from both root and sub-items in the confirmation payload.
+- Expanded persisted `selectedAttachments` metadata in `jira-wizard-answers.json` with `issueKey` and `issueTitle`.
+
+## 2026-08-11 - v0.2.25
+- Updated `Agents/01-Harvest-Read-Jira.Agent.md` input contract to explicitly require retrieval of sub-item data when present.
+
+## 2026-08-11 - v0.2.26
+- Updated `Scripts/Harvest-wizard.cjs` fetch-result layout so sub-items are shown inside the `Opgehaald` block directly under `Root item:` as `Sub item(s):`.
+- Removed the separate `Sub-items` section from fetch-result.
+- Kept sub-item attachments included in the existing `Bijlagen` block.
+
+## 2026-08-11 - v0.2.27
+- Updated `Scripts/Harvest-wizard.cjs` so `Sub item(s):` entries in the `Opgehaald` block render as plain lines without bullet markers.
+
+## 2026-08-11 - v0.2.28
+- Updated `Scripts/Harvest-wizard.cjs` `Beschrijving` block to show item-scoped descriptions.
+- `Root item` description is now always shown first.
+- Added sub-item description sections labeled per sub-item, only when a sub-item description is present.
+- Sub-items without a description are omitted from the `Beschrijving` block.
+
+## 2026-08-11 - v0.2.29
+- Updated `Scripts/Harvest-wizard.cjs` fetch-result primary action button label from `Bevestigen` to `Analyseren`.

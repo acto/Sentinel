@@ -56,6 +56,7 @@ After summary review:
 Use wizard-provided Jira key and/or user-provided Jira context.
 If key data is missing, ask concise clarification questions.
 Never invent Jira facts.
+When a root Jira item has sub-items, retrieve and include sub-item data in the Harvest analysis package.
 
 ## Required Analysis Output
 Produce all sections below in this order:

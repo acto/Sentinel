@@ -889,25 +889,54 @@ async function fetchJiraViaMcp(jiraKey) {
     }, 90000);
     const rootParsed = parseMcpToolResult(rootRaw);
     const rootIssue = rootParsed && rootParsed.issue ? rootParsed.issue : rootParsed;
+    const childIssueKeys = extractChildIssueKeys(rootIssue);
+    const childIssues = [];
+    const childIssueErrors = [];
+
+    for (const childKey of childIssueKeys) {
+      try {
+        const childRaw = await client.request('tools/call', {
+          name: 'read_jira_issue',
+          arguments: { issueKey: childKey }
+        }, 90000);
+        const childParsed = parseMcpToolResult(childRaw);
+        const childIssue = childParsed && childParsed.issue ? childParsed.issue : childParsed;
+        if (childIssue && typeof childIssue === 'object') {
+          childIssues.push(childIssue);
+        }
+      } catch (childErr) {
+        childIssueErrors.push({
+          issueKey: childKey,
+          error: childErr && (childErr.message || String(childErr)) || 'Onbekende fout'
+        });
+      }
+    }
 
     const normalized = {
       jiraKey: jiraKey,
       fetchedAt: new Date().toISOString(),
-      rootIssue: rootIssue
+      rootIssue: rootIssue,
+      childIssueKeys: childIssueKeys,
+      childIssues: childIssues
     };
+    if (childIssueErrors.length) normalized.childIssueErrors = childIssueErrors;
 
     fs.writeFileSync(fetchedPath, JSON.stringify(normalized, null, 2), 'utf8');
     try { if (fs.existsSync(fetchErrorPath)) fs.unlinkSync(fetchErrorPath); } catch (_) {}
   } catch (e) {
     var details = e && (e.message || String(e)) || 'Onbekende fout';
     try {
-      const issue = await fetchJiraViaRest(jiraKey, launch.mergedEnv);
+      const rootIssue = await fetchJiraViaRest(jiraKey, launch.mergedEnv);
+      const childFetch = await fetchChildIssuesViaRest(rootIssue, launch.mergedEnv);
       const normalizedFallback = {
         jiraKey: jiraKey,
         fetchedAt: new Date().toISOString(),
         source: 'rest-fallback',
-        rootIssue: issue
+        rootIssue: rootIssue,
+        childIssueKeys: childFetch.childIssueKeys,
+        childIssues: childFetch.childIssues
       };
+      if (childFetch.childIssueErrors.length) normalizedFallback.childIssueErrors = childFetch.childIssueErrors;
       fs.writeFileSync(fetchedPath, JSON.stringify(normalizedFallback, null, 2), 'utf8');
       try { if (fs.existsSync(fetchErrorPath)) fs.unlinkSync(fetchErrorPath); } catch (_) {}
       return;
@@ -924,6 +953,45 @@ async function fetchJiraViaMcp(jiraKey) {
   } finally {
     if (client) client.close();
   }
+}
+
+function extractChildIssueKeys(issue) {
+  if (!issue || typeof issue !== 'object') return [];
+  const fields = issue.fields && typeof issue.fields === 'object' ? issue.fields : {};
+  const subtasks = Array.isArray(fields.subtasks) ? fields.subtasks : [];
+  const keys = [];
+  for (const subtask of subtasks) {
+    if (!subtask || typeof subtask !== 'object') continue;
+    const k = String(subtask.key || subtask.issueKey || subtask.id || '').trim();
+    if (k) keys.push(k);
+  }
+  return Array.from(new Set(keys));
+}
+
+async function fetchChildIssuesViaRest(rootIssue, mergedEnv) {
+  const childIssueKeys = extractChildIssueKeys(rootIssue);
+  const childIssues = [];
+  const childIssueErrors = [];
+
+  for (const childKey of childIssueKeys) {
+    try {
+      const childIssue = await fetchJiraViaRest(childKey, mergedEnv);
+      if (childIssue && typeof childIssue === 'object') {
+        childIssues.push(childIssue);
+      }
+    } catch (e) {
+      childIssueErrors.push({
+        issueKey: childKey,
+        error: e && (e.message || String(e)) || 'Onbekende fout'
+      });
+    }
+  }
+
+  return {
+    childIssueKeys: childIssueKeys,
+    childIssues: childIssues,
+    childIssueErrors: childIssueErrors
+  };
 }
 
 async function fetchJiraViaRest(jiraKey, mergedEnv) {
@@ -1463,7 +1531,16 @@ const server = http.createServer(async function(req, res) {
       return Array.isArray(arr) ? arr : [];
     }
 
+    function pickChildIssues(data) {
+      if (!data || typeof data !== 'object') return [];
+      if (Array.isArray(data.childIssues)) return data.childIssues.filter(function(x) { return x && typeof x === 'object'; });
+      if (Array.isArray(data.subIssues)) return data.subIssues.filter(function(x) { return x && typeof x === 'object'; });
+      if (Array.isArray(data.underlyingIssues)) return data.underlyingIssues.filter(function(x) { return x && typeof x === 'object'; });
+      return [];
+    }
+
     var root = pickRootIssue(fetched) || {};
+    var childIssues = pickChildIssues(fetched);
     var rootKey = getIssueKey(root);
     var rootTitle = getIssueTitle(root);
     var rootLabel = rootKey || 'Onbekend';
@@ -1471,22 +1548,74 @@ const server = http.createServer(async function(req, res) {
       rootLabel += ' - ' + rootTitle;
     }
 
-    var description = getIssueDescription(root);
-    var descriptionHtml = description
-      ? '<div style="white-space:pre-wrap;background:#f7f8fa;border:1px solid #dfe1e6;padding:12px;border-radius:8px;">' + escHtml(description) + '</div>'
-      : '<p class="empty">Geen beschrijving gevonden.</p>';
+    var rootDescription = getIssueDescription(root);
+    var rootDescriptionHtml = '<div style="margin-bottom:12px">'
+      + '<div style="font-size:.82rem;font-weight:700;color:#666;letter-spacing:.01em;margin-bottom:6px;white-space:nowrap">Root item:</div>'
+      + (rootDescription
+        ? '<div style="white-space:pre-wrap;background:#f7f8fa;border:1px solid #dfe1e6;padding:12px;border-radius:8px;">' + escHtml(rootDescription) + '</div>'
+        : '<p class="empty" style="margin:0">Geen beschrijving gevonden.</p>')
+      + '</div>';
 
-    var attachments = getIssueAttachments(root);
-    var attachmentsHtml = attachments.length
-      ? '<ul>' + attachments.map(function(a, idx) {
-        var fileName = String((a && (a.filename || a.name)) || 'Onbekende bijlage');
-        var attachmentId = String((a && (a.id || a.attachmentId)) || '');
+    var childDescriptions = [];
+    for (var cd = 0; cd < childIssues.length; cd++) {
+      var childIssue = childIssues[cd];
+      var childDescription = getIssueDescription(childIssue);
+      if (!childDescription) continue;
+      var childKey = getIssueKey(childIssue);
+      var childTitle = getIssueTitle(childIssue);
+      var childLabel = childKey || 'Onbekend';
+      if (childTitle) childLabel += ' - ' + childTitle;
+      childDescriptions.push(
+        '<div style="margin-bottom:12px">'
+        + '<div style="font-size:.82rem;font-weight:700;color:#666;letter-spacing:.01em;margin-bottom:6px;white-space:normal;overflow-wrap:anywhere;word-break:break-word">Sub item: ' + escHtml(childLabel) + '</div>'
+        + '<div style="white-space:pre-wrap;background:#f7f8fa;border:1px solid #dfe1e6;padding:12px;border-radius:8px;">' + escHtml(childDescription) + '</div>'
+        + '</div>'
+      );
+    }
+
+    var descriptionHtml = rootDescriptionHtml + (childDescriptions.length ? childDescriptions.join('') : '');
+
+    var childItemsInOpgehaaldHtml = childIssues.length
+      ? '<div style="display:flex;flex-direction:column;gap:4px">' + childIssues.map(function(issue) {
+        var key = getIssueKey(issue);
+        var title = getIssueTitle(issue);
+        var label = key || 'Onbekend';
+        if (title) label += ' - ' + title;
+        return '<div>' + escHtml(label) + '</div>';
+      }).join('') + '</div>'
+      : '<span class="empty">Geen sub-items gevonden.</span>';
+
+    var attachmentRows = [];
+    var allIssues = [root].concat(childIssues);
+    for (var i = 0; i < allIssues.length; i++) {
+      var issue = allIssues[i];
+      var issueKey = getIssueKey(issue);
+      var issueTitle = getIssueTitle(issue);
+      var issueLabel = issueKey || 'Onbekend';
+      if (issueTitle) issueLabel += ' - ' + issueTitle;
+      var issueAttachments = getIssueAttachments(issue);
+      for (var j = 0; j < issueAttachments.length; j++) {
+        var a = issueAttachments[j];
+        attachmentRows.push({
+          issueKey: issueKey,
+          issueTitle: issueTitle,
+          issueLabel: issueLabel,
+          fileName: String((a && (a.filename || a.name)) || 'Onbekende bijlage'),
+          attachmentId: String((a && (a.id || a.attachmentId)) || '')
+        });
+      }
+    }
+
+    var attachmentsHtml = attachmentRows.length
+      ? '<ul>' + attachmentRows.map(function(row, idx) {
         return '<li style="display:flex;align-items:flex-start;gap:10px;">'
           + '<input type="checkbox" class="att-inc" name="attachmentInclude" checked '
           + 'data-index="' + String(idx) + '" '
-          + 'data-id="' + escHtml(attachmentId) + '" '
-          + 'data-filename="' + escHtml(fileName) + '">'
-          + '<span>' + escHtml(rootLabel) + ' | ' + escHtml(fileName) + '</span>'
+          + 'data-issue-key="' + escHtml(String(row.issueKey || '')) + '" '
+          + 'data-issue-title="' + escHtml(String(row.issueTitle || '')) + '" '
+          + 'data-id="' + escHtml(row.attachmentId) + '" '
+          + 'data-filename="' + escHtml(row.fileName) + '">'
+          + '<span>' + escHtml(row.issueLabel) + ' | ' + escHtml(row.fileName) + '</span>'
           + '</li>';
       }).join('') + '</ul>'
       : '<p class="empty">Geen bijlagen gevonden.</p>';
@@ -1504,12 +1633,16 @@ const server = http.createServer(async function(req, res) {
       + '<span style="font-size:.82rem;font-weight:700;color:#666;letter-spacing:.01em;white-space:nowrap">Root item:</span>'
       + '<span class="h-value" style="flex:1;min-width:0;white-space:normal;overflow-wrap:anywhere;word-break:break-word">' + escHtml(rootLabel) + '</span>'
       + '</div>'
+      + '<div class="h-item" style="display:flex;align-items:flex-start;gap:6px;white-space:normal;overflow:visible">'
+      + '<span style="font-size:.82rem;font-weight:700;color:#666;letter-spacing:.01em;white-space:nowrap">Sub item(s):</span>'
+      + '<span class="h-value" style="flex:1;min-width:0;white-space:normal;overflow-wrap:anywhere;word-break:break-word">' + childItemsInOpgehaaldHtml + '</span>'
+      + '</div>'
       + '<h2>Beschrijving</h2>'
       + descriptionHtml
       + '<h2>Bijlagen</h2>'
       + attachmentsHtml
       + '<div class="actions">'
-      + '<button class="btn" id="btnOk" onclick="bevestig()">Bevestigen</button>'
+      + '<button class="btn" id="btnOk" onclick="bevestig()">Analyseren</button>'
       + '<button type="button" class="btn btn-cancel" onclick="location.href=\'/cancel\'">Annuleren</button>'
       + '</div>'
       + '<script>'
@@ -1519,6 +1652,8 @@ const server = http.createServer(async function(req, res) {
       + '  var selected = Array.prototype.slice.call(document.querySelectorAll("input[name=attachmentInclude]")).map(function(el){'
       + '    return {'
       + '      index: Number(el.getAttribute("data-index") || 0),'
+      + '      issueKey: el.getAttribute("data-issue-key") || "",'
+      + '      issueTitle: el.getAttribute("data-issue-title") || "",'
       + '      id: el.getAttribute("data-id") || "",'
       + '      filename: el.getAttribute("data-filename") || "",'
       + '      include: !!el.checked'
@@ -1655,6 +1790,8 @@ const server = http.createServer(async function(req, res) {
             answers.selectedAttachments = payload.selectedAttachments.map(function(item) {
               return {
                 index: Number(item && item.index || 0),
+                issueKey: String(item && item.issueKey || ''),
+                issueTitle: String(item && item.issueTitle || ''),
                 id: String(item && item.id || ''),
                 filename: String(item && item.filename || ''),
                 include: !!(item && item.include)
