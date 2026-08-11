@@ -266,3 +266,7 @@
 ## 2026-08-11 - v0.2.58
 - Added new skill `.github/skills/jira-summary/SKILL.md` to standardize Harvest summary generation from descriptions, comments, and selected attachments including extraction guardrails.
 - Documented summary persistence contract in the skill for `harvest-<JIRAKEY>.md` and `harvest-<JIRAKEY>.meta.json` plus required metadata fields.
+
+## 2026-08-11 - v0.2.59
+- Restored missing skill files under `.github/skills` after branch alignment moved to a commit state without the skill directory.
+- Recreated `fetch-jira-items`, `jira-items-analyse`, and `jira-summary` skill definitions.
