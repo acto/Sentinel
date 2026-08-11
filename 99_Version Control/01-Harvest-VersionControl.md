@@ -141,3 +141,20 @@
 
 ## 2026-08-11 - v0.2.29
 - Updated `Scripts/Harvest-wizard.cjs` fetch-result primary action button label from `Bevestigen` to `Analyseren`.
+
+## 2026-08-11 - v0.2.30
+- Added reusable workspace skill `Fetch JIRA items` at `.github/skills/fetch-jira-items/SKILL.md`.
+- Captured standardized Harvest Jira fetch rules for root item + sub-items, description ordering, and attachment inclusion.
+- Documented guardrails for partial sub-item fetch failures with `childIssueErrors`.
+
+## 2026-08-11 - v0.2.31
+- Added prompt `Prompts/02-Harvest-Fetch-Jira-Items.prompt.md` to start Harvest Jira fetch with explicit `fetch-jira-items` skill guidance.
+- Wired prompt to agent `01-Harvest-Read-Jira` and standardized input hint for Jira key plus optional context.
+
+## 2026-08-11 - v0.2.32
+- Moved skill file `Fetch JIRA items` from `.github/skills/fetch-jira-items/SKILL.md` to `97_Skills/fetch-jira-items/SKILL.md`.
+
+## 2026-08-11 - v0.2.33
+- Reverted the skill location change to preserve VS Code/Copilot skill autoload behavior.
+- Moved `Fetch JIRA items` back to `.github/skills/fetch-jira-items/SKILL.md`.
+- Removed temporary `97_Skills` skill location.
