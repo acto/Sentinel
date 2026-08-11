@@ -5,17 +5,16 @@
  * Flow:
  *   1. Always opens in Chrome.
  *   2. Shows a splash screen (light gray background, Harvest.png centered).
- *   3. Splash polls /ready; once the agent signals /instructions-ready the
- *      splash navigates to /wizard where the user enters a Jira issue key.
+ *   3. Splash navigates to /wizard where the user enters a Jira issue key.
  *   4. On submit: writes $TEMP/jira-wizard-answers.json, logs RESULT:bevestigd.
  *   5. Shows a /working spinner while the agent fetches Jira data.
- *   6. Renders /summary when the agent writes $TEMP/jira-summary.md.
+ *   6. Renders /fetch-result when the agent writes $TEMP/jira-fetched.json.
  *   7. User confirms or cancels; writes $TEMP/jira-action.txt accordingly.
  *
  * Stdout signals (read by agent via get_terminal_output):
  *   RESULT:bevestigd   — user submitted a valid Jira key
  *   RESULT:cancelled   — user cancelled
- *   CONFIRMED:ok       — user accepted the summary
+ *   CONFIRMED:ok       — user confirmed fetched Jira data
  */
 'use strict';
 
@@ -28,6 +27,7 @@ const PORT         = 3133;
 const TEMP         = process.env.TEMP || require('os').tmpdir();
 const WORKSPACE    = path.resolve(__dirname, '..');
 const SPLASH_STANDARD_PATH = path.join(WORKSPACE, 'Scripts', 'splashscreen-standard.json');
+const MCP_CONFIG_PATH = path.join(WORKSPACE, '.vscode', 'mcp.json');
 
 const SPLASH_STANDARD_DEFAULTS = {
   durationMs: 5000,
@@ -61,6 +61,7 @@ const actionPath   = path.join(TEMP, 'jira-action.txt');
 const summaryPath  = path.join(TEMP, 'jira-summary.md');
 const warningPath  = path.join(TEMP, 'jira-existing-warning.json');
 const fetchedPath      = path.join(TEMP, 'jira-fetched.json');
+const fetchErrorPath   = path.join(TEMP, 'jira-fetch-error.json');
 const dorCheckPath = path.join(TEMP, 'jira-dor-check.json');
 const testabilityCheckPath = path.join(TEMP, 'jira-testability-check.json');
 const redirectHtml = path.join(TEMP, 'Harvest-wizard-redirect.html');
@@ -582,10 +583,352 @@ function parseForm(body) {
   return params;
 }
 
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
-let instructionsReady = false;
+function writeFetchError(code, message, details) {
+  const payload = {
+    code: code,
+    message: message,
+    details: details || '',
+    at: new Date().toISOString()
+  };
+  try { fs.writeFileSync(fetchErrorPath, JSON.stringify(payload, null, 2), 'utf8'); } catch (_) {}
+}
+
+function parseMcpToolResult(result) {
+  if (!result || typeof result !== 'object') return null;
+  if (result.structuredContent && typeof result.structuredContent === 'object') return result.structuredContent;
+  if (!Array.isArray(result.content)) return result;
+
+  const textParts = result.content
+    .filter(function(part) { return part && part.type === 'text' && typeof part.text === 'string'; })
+    .map(function(part) { return part.text; });
+
+  if (!textParts.length) return result;
+  const joined = textParts.join('\n').trim();
+  if (!joined) return result;
+
+  try {
+    return JSON.parse(joined);
+  } catch (_) {
+    return { text: joined };
+  }
+}
+
+function loadMcpServerLaunchConfig() {
+  const fallback = {
+    command: process.platform === 'win32' ? 'npx.cmd' : 'npx',
+    args: ['-y', 'mcp-atlassian'],
+    env: {}
+  };
+
+  try {
+    const raw = fs.readFileSync(MCP_CONFIG_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    const server = parsed && parsed.servers && parsed.servers['mcp-atlassian'];
+    if (!server || !server.command) return fallback;
+
+    const args = Array.isArray(server.args)
+      ? server.args.map(function(a) { return String(a); })
+      : [];
+    const env = server.env && typeof server.env === 'object' ? server.env : {};
+
+    return {
+      command: String(server.command),
+      args: args,
+      env: env
+    };
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function getMcpConfigHealth() {
+  const required = ['ATLASSIAN_BASE_URL', 'ATLASSIAN_EMAIL', 'ATLASSIAN_API_TOKEN'];
+  const launch = loadMcpServerLaunchConfig();
+  const mergedEnv = buildMcpEnv(launch.env);
+
+  const unresolvedInputs = required.filter(function(k) {
+    const raw = String((launch.env && launch.env[k]) || '').trim();
+    return /^\$\{input:[^}]+\}$/.test(raw);
+  });
+
+  const missingValues = required.filter(function(k) {
+    const v = String(mergedEnv[k] || '').trim();
+    return !v || /^\$\{input:[^}]+\}$/.test(v);
+  });
+
+  return {
+    launch: launch,
+    unresolvedInputs: unresolvedInputs,
+    missingValues: missingValues,
+    isHealthy: missingValues.length === 0
+  };
+}
+
+function resolveTemplateEnvValue(value) {
+  const asString = String(value == null ? '' : value);
+  const m = asString.match(/^\$\{input:([^}]+)\}$/);
+  if (!m) return asString;
+
+  const key = m[1].toLowerCase();
+  if (key.indexOf('baseurl') !== -1) return process.env.ATLASSIAN_BASE_URL || '';
+  if (key.indexOf('email') !== -1) return process.env.ATLASSIAN_EMAIL || '';
+  if (key.indexOf('token') !== -1) return process.env.ATLASSIAN_API_TOKEN || '';
+  return '';
+}
+
+function buildMcpEnv(serverEnv) {
+  const merged = Object.assign({}, process.env);
+  const envObj = serverEnv && typeof serverEnv === 'object' ? serverEnv : {};
+  for (const [k, v] of Object.entries(envObj)) {
+    merged[k] = resolveTemplateEnvValue(v);
+  }
+  return merged;
+}
+
+function quoteCmdArg(arg) {
+  const s = String(arg == null ? '' : arg);
+  if (!s.length) return '""';
+  if (!/[\s"]/g.test(s)) return s;
+  // cmd.exe expects embedded quotes to be doubled, not backslash-escaped.
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+function createMcpClient(launch) {
+  const chosen = launch || loadMcpServerLaunchConfig();
+  const env = chosen.mergedEnv || buildMcpEnv(chosen.env);
+
+  let child;
+  if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(String(chosen.command || ''))) {
+    const cmdline = quoteCmdArg(chosen.command) + (Array.isArray(chosen.args) && chosen.args.length
+      ? ' ' + chosen.args.map(quoteCmdArg).join(' ')
+      : '');
+    // Node on this Windows runtime throws EINVAL for direct .cmd spawn.
+    // Run through cmd.exe while keeping stdio pipes attached to the child process.
+    const comspec = process.env.ComSpec || 'cmd.exe';
+    child = cp.spawn(comspec, ['/d', '/s', '/c', cmdline], {
+      env: env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+      shell: false
+    });
+  } else {
+    child = cp.spawn(chosen.command, chosen.args, {
+      env: env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+      shell: false
+    });
+  }
+
+  let nextId = 1;
+  const pending = new Map();
+  let stdoutBuf = Buffer.alloc(0);
+  let stderrBuf = '';
+
+  function settleAll(err) {
+    for (const p of pending.values()) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+    pending.clear();
+  }
+
+  function parseFrames() {
+    while (true) {
+      const headerEnd = stdoutBuf.indexOf('\r\n\r\n');
+      if (headerEnd === -1) return;
+
+      const headerText = stdoutBuf.slice(0, headerEnd).toString('utf8');
+      const lenMatch = headerText.match(/Content-Length:\s*(\d+)/i);
+      if (!lenMatch) {
+        stdoutBuf = stdoutBuf.slice(headerEnd + 4);
+        continue;
+      }
+
+      const len = Number(lenMatch[1]);
+      const frameStart = headerEnd + 4;
+      const frameEnd = frameStart + len;
+      if (stdoutBuf.length < frameEnd) return;
+
+      const jsonStr = stdoutBuf.slice(frameStart, frameEnd).toString('utf8');
+      stdoutBuf = stdoutBuf.slice(frameEnd);
+
+      let msg;
+      try { msg = JSON.parse(jsonStr); } catch (_) { continue; }
+      if (!Object.prototype.hasOwnProperty.call(msg, 'id')) continue;
+
+      const p = pending.get(msg.id);
+      if (!p) continue;
+      pending.delete(msg.id);
+      clearTimeout(p.timer);
+
+      if (msg.error) p.reject(new Error(String(msg.error.message || 'MCP error')));
+      else p.resolve(msg.result);
+    }
+  }
+
+  child.stdout.on('data', function(chunk) {
+    stdoutBuf = Buffer.concat([stdoutBuf, chunk]);
+    parseFrames();
+  });
+
+  child.stderr.on('data', function(chunk) {
+    stderrBuf += String(chunk);
+  });
+
+  child.on('error', function(err) {
+    settleAll(err);
+  });
+
+  child.on('exit', function(code) {
+    if (pending.size > 0) {
+      const msg = 'MCP process exited with code ' + String(code) + (stderrBuf ? (': ' + stderrBuf.trim()) : '');
+      settleAll(new Error(msg));
+    }
+  });
+
+  function sendMessage(obj) {
+    const payload = Buffer.from(JSON.stringify(obj), 'utf8');
+    const header = Buffer.from('Content-Length: ' + payload.length + '\r\n\r\n', 'utf8');
+    child.stdin.write(Buffer.concat([header, payload]));
+  }
+
+  function request(method, params, timeoutMs) {
+    return new Promise(function(resolve, reject) {
+      const id = nextId++;
+      const timer = setTimeout(function() {
+        pending.delete(id);
+        reject(new Error('MCP timeout on ' + method));
+      }, timeoutMs || 30000);
+
+      pending.set(id, { resolve: resolve, reject: reject, timer: timer });
+      sendMessage({ jsonrpc: '2.0', id: id, method: method, params: params || {} });
+    });
+  }
+
+  function notify(method, params) {
+    sendMessage({ jsonrpc: '2.0', method: method, params: params || {} });
+  }
+
+  function close() {
+    try { child.stdin.end(); } catch (_) {}
+    try { child.kill(); } catch (_) {}
+  }
+
+  return {
+    request: request,
+    notify: notify,
+    close: close
+  };
+}
+
+function collectUnderlyingKeysFromIssue(issue) {
+  const keys = [];
+  const seen = Object.create(null);
+
+  function add(k) {
+    k = String(k || '').trim();
+    if (!k || seen[k]) return;
+    seen[k] = true;
+    keys.push(k);
+  }
+
+  if (!issue || !issue.fields || typeof issue.fields !== 'object') return keys;
+
+  const subtasks = issue.fields.subtasks;
+  if (Array.isArray(subtasks)) {
+    subtasks.forEach(function(st) { add(st && (st.key || st.issueKey)); });
+  }
+
+  const links = issue.fields.issuelinks;
+  if (Array.isArray(links)) {
+    links.forEach(function(link) {
+      if (link && link.outwardIssue) add(link.outwardIssue.key || link.outwardIssue.issueKey);
+      if (link && link.inwardIssue) add(link.inwardIssue.key || link.inwardIssue.issueKey);
+    });
+  }
+
+  return keys;
+}
+
+async function fetchJiraViaMcp(jiraKey) {
+  const health = getMcpConfigHealth();
+  const launch = health.launch;
+  launch.mergedEnv = buildMcpEnv(launch.env);
+
+  if (health.missingValues.length) {
+    const details = health.unresolvedInputs.length
+      ? 'In .vscode/mcp.json staan nog ${input:...} placeholders voor: ' + health.unresolvedInputs.join(', ') + '. Vul hier concrete waarden in voor deze wizard-run.'
+      : 'Vul de waarden direct in .vscode/mcp.json onder servers.mcp-atlassian.env voor: ' + health.missingValues.join(', ');
+    writeFetchError(
+      'missing-env',
+      'MCP credentials ontbreken in de configuratie.',
+      details
+    );
+    return;
+  }
+
+  let client = null;
+  try {
+    client = createMcpClient(launch);
+    await client.request('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'sentinel-harvest-wizard', version: '0.2.15' }
+    }, 15000);
+    client.notify('notifications/initialized', {});
+
+    await client.request('tools/call', {
+      name: 'get_jira_current_user',
+      arguments: {}
+    }, 20000);
+
+    const rootRaw = await client.request('tools/call', {
+      name: 'read_jira_issue',
+      arguments: { issueKey: jiraKey }
+    }, 30000);
+    const rootParsed = parseMcpToolResult(rootRaw);
+    const rootIssue = rootParsed && rootParsed.issue ? rootParsed.issue : rootParsed;
+
+    const underlyingKeys = collectUnderlyingKeysFromIssue(rootIssue).filter(function(k) { return k !== jiraKey; });
+    const underlyingItems = [];
+
+    for (const childKey of underlyingKeys) {
+      try {
+        const childRaw = await client.request('tools/call', {
+          name: 'read_jira_issue',
+          arguments: { issueKey: childKey }
+        }, 20000);
+        const childParsed = parseMcpToolResult(childRaw);
+        underlyingItems.push(childParsed && childParsed.issue ? childParsed.issue : childParsed);
+      } catch (_) {
+        underlyingItems.push({ key: childKey });
+      }
+    }
+
+    const normalized = {
+      jiraKey: jiraKey,
+      fetchedAt: new Date().toISOString(),
+      rootIssue: rootIssue,
+      underlyingKeys: underlyingKeys,
+      underlyingItems: underlyingItems
+    };
+
+    fs.writeFileSync(fetchedPath, JSON.stringify(normalized, null, 2), 'utf8');
+    try { if (fs.existsSync(fetchErrorPath)) fs.unlinkSync(fetchErrorPath); } catch (_) {}
+  } catch (e) {
+    var details = e && (e.message || String(e)) || 'Onbekende fout';
+    if (/ENOENT/i.test(details)) {
+      details += ' (MCP command niet gevonden. Controleer command en args in .vscode/mcp.json.)';
+    }
+    if (/EINVAL/i.test(details)) {
+      details += ' (Windows spawn-fout. Gebruik een geldig command in .vscode/mcp.json; voor npx op Windows: C:\\Program Files\\nodejs\\npx.cmd.)';
+    }
+    writeFetchError('mcp-fetch-failed', 'Jira ophalen via MCP is mislukt.', details);
+  } finally {
+    if (client) client.close();
+  }
+}
 
 // ---------------------------------------------------------------------------
 // HTTP server
@@ -621,22 +964,18 @@ const server = http.createServer(async function(req, res) {
     return send(res, 200, 'text/html', html);
   }
 
-  // ── Agent signals instruction files are loaded ───────────────────────────
-  if (url === '/instructions-ready' && req.method === 'POST') {
-    instructionsReady = true;
-    res.writeHead(200); res.end('ok');
-    return;
-  }
-
-  // ── Polled by splash to know when to navigate to /wizard ────────────────
-  if (url === '/ready') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ready: instructionsReady }));
-    return;
-  }
-
   // ── Wizard form ─────────────────────────────────────────────────────────
   if (url === '/wizard') {
+    const health = getMcpConfigHealth();
+    const healthWarningHtml = health.isHealthy
+      ? ''
+      : '<div style="margin:10px 0 14px;padding:10px 12px;border:1px solid #f0d98c;background:#fff8e6;border-radius:8px;color:#6b5400;font-size:.88rem;">'
+      + '<strong>MCP-config nog niet compleet.</strong><br>'
+      + (health.unresolvedInputs.length
+        ? 'In .vscode/mcp.json staan nog ${input:...} placeholders voor: ' + escHtml(health.unresolvedInputs.join(', ')) + '.'
+        : 'Ontbrekende waarden in .vscode/mcp.json: ' + escHtml(health.missingValues.join(', ')) + '.')
+      + '</div>';
+
     const html = '<!DOCTYPE html><html lang="nl" translate="no"><head>'
       + '<meta charset="UTF-8"><meta name="google" content="notranslate">'
       + '<style>' + CSS + '</style></head><body>'
@@ -649,6 +988,7 @@ const server = http.createServer(async function(req, res) {
       + ' autocomplete="off" autofocus spellcheck="false" required>'
       + '<div class="error" id="err-required">Dit veld is verplicht. Vul een Jira-issuenummer in.</div>'
       + '<div class="error" id="err-format">Ongeldig formaat. Gebruik bijv. RB-1234 (letters gevolgd door een koppelteken en cijfers).</div>'
+      + healthWarningHtml
       + '<div class="actions">'
       + '<button type="submit" class="btn" id="sub" style="display:none">Volgende &#8594;</button>'
       + '<button type="button" class="btn btn-cancel" onclick="location.href=\'/cancel\'">Annuleren</button>'
@@ -715,21 +1055,31 @@ const server = http.createServer(async function(req, res) {
 
     // Clear any stale summary and DoR check from a previous run so /working waits for fresh data
     if (fs.existsSync(fetchedPath))          fs.unlinkSync(fetchedPath);
+    if (fs.existsSync(fetchErrorPath))       fs.unlinkSync(fetchErrorPath);
     if (fs.existsSync(summaryPath))          fs.unlinkSync(summaryPath);
     if (fs.existsSync(dorCheckPath))         fs.unlinkSync(dorCheckPath);
     if (fs.existsSync(testabilityCheckPath)) fs.unlinkSync(testabilityCheckPath);
 
     console.log('RESULT:bevestigd');
 
-    // Check immediately if a harvest file already exists for this key
-    const harvestFile = path.join(WORKSPACE, '01-Harvest-Jira-Summaries', 'Harvest-' + jiraKey + '.md');
-    if (fs.existsSync(harvestFile)) {
-      fs.writeFileSync(warningPath, JSON.stringify({ jiraKey: jiraKey }), 'utf8');
-      res.writeHead(302, { Location: '/existing-warning' }); res.end();
-    } else {
-      try { if (fs.existsSync(warningPath)) fs.unlinkSync(warningPath); } catch(_){}
-      res.writeHead(302, { Location: '/working' }); res.end();
-    }
+    // Trigger Jira fetch immediately from the wizard process.
+    var fetchFinished = false;
+    fetchJiraViaMcp(jiraKey)
+      .then(function() { fetchFinished = true; })
+      .catch(function(e) {
+        fetchFinished = true;
+        writeFetchError('mcp-fetch-failed', 'Jira ophalen via MCP is mislukt.', e && (e.message || String(e)) || 'Onbekende fout');
+      });
+
+    // Fail-safe: never leave /working spinning forever without outcome files.
+    setTimeout(function() {
+      if (fetchFinished) return;
+      if (fs.existsSync(fetchedPath) || fs.existsSync(fetchErrorPath)) return;
+      writeFetchError('mcp-timeout', 'Jira ophalen via MCP duurt te lang.', 'Er is na 75 seconden geen resultaat ontvangen van de MCP-server. Controleer netwerk, credentials en MCP package startup.');
+    }, 75000);
+
+    try { if (fs.existsSync(warningPath)) fs.unlinkSync(warningPath); } catch(_){ }
+    res.writeHead(302, { Location: '/working' }); res.end();
     return;
   }
 
@@ -790,10 +1140,8 @@ const server = http.createServer(async function(req, res) {
       + 'function poll(){'
       + '  fetch("/status-all?ts="+Date.now(),{cache:"no-store"}).then(function(r){return r.json();})'
       + '  .then(function(d){'
-      + '    if(d.summary){setP(100);setTimeout(function(){location.href="/summary";},400);return;}'
-      + '    else if(d.testability){setPhase("testability");setStatus("Samenvatting wordt opgesteld\u2026");}'
-      + '    else if(d.dor){setPhase("dor");setStatus("Testbaarheid controleren\u2026");}'
-      + '    else if(d.fetched){setPhase("fetched");setStatus("Jira-gegevens analyseren\u2026");}'
+      + '    if(d.fetchError){location.href="/fetch-error";return;}'
+      + '    if(d.fetched){setP(100);setTimeout(function(){location.href="/fetch-result";},400);return;}'
       + '    else{setPhase("waiting");setStatus("Jira-gegevens worden opgehaald\u2026");}'
       + '    if(phase==="waiting" && Date.now()-phaseStart>120000){'
       + '      var h=document.getElementById("stuck-help");if(h)h.style.display="block";'
@@ -982,11 +1330,158 @@ const server = http.createServer(async function(req, res) {
     });
     res.end(JSON.stringify({
       fetched:     fs.existsSync(fetchedPath),
+      fetchError:  fs.existsSync(fetchErrorPath),
       dor:         fs.existsSync(dorCheckPath),
       testability: fs.existsSync(testabilityCheckPath),
       summary:     fs.existsSync(summaryPath)
     }));
     return;
+  }
+
+  // ── Fetch-error — when MCP fetch fails, show immediate actionable message ──
+  if (url === '/fetch-error') {
+    var err = { code: 'unknown', message: 'Onbekende fout tijdens Jira-ophalen.', details: '' };
+    try { err = JSON.parse(fs.readFileSync(fetchErrorPath, 'utf8')); } catch (_) {}
+
+    var html = '<!DOCTYPE html><html lang="nl" translate="no"><head>'
+      + '<meta charset="UTF-8"><style>' + SUMMARY_CSS + '</style></head><body>'
+      + '<div class="top-header">'
+      + '<img src="' + LOGO + '" class="logo" alt="Logo">'
+      + '<div class="issue-header"><span class="issue-title">Jira ophalen mislukt</span></div>'
+      + '</div>'
+      + '<div style="background:#fff0ee;border-left:5px solid #de350b;border-radius:6px;padding:14px 18px;margin-bottom:20px;">'
+      + '<p><strong>' + escHtml(err.message || 'Jira ophalen mislukt.') + '</strong></p>'
+      + '<p style="margin-top:8px;"><strong>Code:</strong> ' + escHtml(err.code || 'unknown') + '</p>'
+      + (err.details ? '<p style="margin-top:8px;"><strong>Details:</strong> ' + escHtml(err.details) + '</p>' : '')
+      + '</div>'
+      + '<p>Controleer MCP/Atlassian instellingen en probeer opnieuw.</p>'
+      + '<div class="actions">'
+      + '<button class="btn" onclick="location.href=\'/wizard\'">Opnieuw</button>'
+      + '<button type="button" class="btn btn-cancel" onclick="location.href=\'/cancel\'">Annuleren</button>'
+      + '</div>'
+      + '</body></html>';
+    return send(res, 200, 'text/html', html);
+  }
+
+  // ── Fetch-result — renders jira-fetched.json with root + underlying item keys ──
+  if (url === '/fetch-result') {
+    var fetched = null;
+    try { fetched = JSON.parse(fs.readFileSync(fetchedPath, 'utf8')); } catch (_) {
+      res.writeHead(302, { Location: '/working' }); res.end(); return;
+    }
+
+    function pickRootIssue(data) {
+      if (!data || typeof data !== 'object') return null;
+      if (data.issue && typeof data.issue === 'object') return data.issue;
+      if (data.rootIssue && typeof data.rootIssue === 'object') return data.rootIssue;
+      if (data.jiraIssue && typeof data.jiraIssue === 'object') return data.jiraIssue;
+      if (data.key || data.fields) return data;
+      return null;
+    }
+
+    function getIssueKey(issue) {
+      if (!issue || typeof issue !== 'object') return '';
+      return String(issue.key || issue.issueKey || issue.id || '').trim();
+    }
+
+    function getIssueTitle(issue) {
+      if (!issue || typeof issue !== 'object') return '';
+      if (issue.fields && typeof issue.fields === 'object') {
+        return String(issue.fields.summary || '').trim();
+      }
+      return String(issue.summary || issue.title || '').trim();
+    }
+
+    function collectUnderlying(data, rootKey) {
+      var items = [];
+      var seen = Object.create(null);
+
+      function addIssueLike(v) {
+        if (!v) return;
+        var k = '';
+        if (typeof v === 'string') {
+          k = v.trim();
+        } else if (typeof v === 'object') {
+          k = getIssueKey(v);
+          if (!k && v.outwardIssue) k = getIssueKey(v.outwardIssue);
+          if (!k && v.inwardIssue) k = getIssueKey(v.inwardIssue);
+          if (!k && v.issue) k = getIssueKey(v.issue);
+        }
+        if (!k || k === rootKey || seen[k]) return;
+        seen[k] = true;
+        items.push(k);
+      }
+
+      function addArray(arr) {
+        if (!Array.isArray(arr)) return;
+        arr.forEach(addIssueLike);
+      }
+
+      if (data && typeof data === 'object') {
+        addArray(data.underlyingItems);
+        addArray(data.childIssues);
+        addArray(data.linkedIssues);
+        addArray(data.descendants);
+
+        var root = pickRootIssue(data);
+        if (root && root.fields && typeof root.fields === 'object') {
+          addArray(root.fields.subtasks);
+          addArray(root.fields.issuelinks);
+        }
+
+        if (Array.isArray(data.issues)) {
+          data.issues.forEach(function(it) {
+            addIssueLike(it);
+            if (it && it.fields && typeof it.fields === 'object') {
+              addArray(it.fields.subtasks);
+              addArray(it.fields.issuelinks);
+            }
+          });
+        }
+      }
+
+      items.sort();
+      return items;
+    }
+
+    var root = pickRootIssue(fetched) || {};
+    var rootKey = getIssueKey(root);
+    var rootTitle = getIssueTitle(root);
+    var underlyingKeys = collectUnderlying(fetched, rootKey);
+    var listHtml = underlyingKeys.length
+      ? '<ul>' + underlyingKeys.map(function(k){ return '<li>' + escHtml(k) + '</li>'; }).join('') + '</ul>'
+      : '<p class="empty">Geen onderliggende items gevonden in de fetch-output.</p>';
+
+    var html = '<!DOCTYPE html><html lang="nl" translate="no"><head>'
+      + '<meta charset="UTF-8"><style>' + SUMMARY_CSS + '</style></head><body>'
+      + '<div class="top-header">'
+      + '<img src="' + LOGO + '" class="logo" alt="Logo">'
+      + '<div class="issue-header">'
+      + (rootKey ? '<span class="badge">' + escHtml(rootKey) + '</span>' : '')
+      + '<span class="issue-title">' + escHtml(rootTitle || 'Jira item opgehaald') + '</span>'
+      + '</div></div>'
+      + '<h2>Opgehaald</h2>'
+      + '<div class="h-item"><span class="h-label">Root item</span><span class="h-value">' + escHtml(rootKey || 'Onbekend') + '</span></div>'
+      + '<div class="h-item"><span class="h-label">Onderliggende items</span><span class="h-value">' + String(underlyingKeys.length) + '</span></div>'
+      + '<h2>Onderliggende Jira-items</h2>'
+      + listHtml
+      + '<div class="actions">'
+      + '<button class="btn" id="btnOk" onclick="bevestig()">Bevestigen</button>'
+      + '<button type="button" class="btn btn-cancel" onclick="location.href=\'/cancel\'">Annuleren</button>'
+      + '</div>'
+      + '<script>'
+      + 'function bevestig(){'
+      + '  document.getElementById("btnOk").disabled=true;'
+      + '  document.getElementById("btnOk").textContent="Bezig\u2026";'
+      + '  fetch("/bevestigen").then(function(){'
+      + '    document.body.innerHTML=\'<div style="text-align:center;padding:80px 24px">\'+'
+      + '\'<h2 style="color:#0052cc">Jira-data bevestigd!</h2>\'+'
+      + '\'<p style="color:#666">Harvest fetch is afgerond. Je kunt nu terug naar VS Code.</p></div>\';'
+      + '  });'
+      + '}'
+      + '<\/script>'
+      + '</body></html>';
+    return send(res, 200, 'text/html', html);
   }
 
   // ── Summary — renders jira-summary.md ────────────────────────────────────
@@ -1211,6 +1706,13 @@ const server = http.createServer(async function(req, res) {
 });
 
 server.listen(PORT, '127.0.0.1', function() {
+  const health = getMcpConfigHealth();
+  if (!health.isHealthy) {
+    const msg = health.unresolvedInputs.length
+      ? 'MCP health-check: unresolved placeholders in .vscode/mcp.json -> ' + health.unresolvedInputs.join(', ')
+      : 'MCP health-check: missing values in .vscode/mcp.json -> ' + health.missingValues.join(', ');
+    console.log(msg);
+  }
   console.log('Wizard listening on http://127.0.0.1:' + PORT);
   openChrome('http://127.0.0.1:' + PORT + '/splash');
 });

@@ -1,4 +1,4 @@
----
+﻿---
 name: "Start Harvest"
 description: "Start 01-Harvest-Read-Jira to analyze Jira input and produce the Harvest handoff package for Sentinel step 2."
 argument-hint: "Provide Jira context or a Jira key (for example RB-1234)."
