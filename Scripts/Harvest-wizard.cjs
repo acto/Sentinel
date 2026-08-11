@@ -670,10 +670,39 @@ function resolveTemplateEnvValue(value) {
   if (!m) return asString;
 
   const key = m[1].toLowerCase();
-  if (key.indexOf('baseurl') !== -1) return process.env.ATLASSIAN_BASE_URL || '';
-  if (key.indexOf('email') !== -1) return process.env.ATLASSIAN_EMAIL || '';
-  if (key.indexOf('token') !== -1) return process.env.ATLASSIAN_API_TOKEN || '';
+  if (key.indexOf('baseurl') !== -1) return readEffectiveEnvValue('ATLASSIAN_BASE_URL');
+  if (key.indexOf('email') !== -1) return readEffectiveEnvValue('ATLASSIAN_EMAIL');
+  if (key.indexOf('token') !== -1) return readEffectiveEnvValue('ATLASSIAN_API_TOKEN');
   return '';
+}
+
+const _winUserEnvCache = Object.create(null);
+function readWindowsUserEnvVar(name) {
+  if (process.platform !== 'win32') return '';
+  if (Object.prototype.hasOwnProperty.call(_winUserEnvCache, name)) {
+    return _winUserEnvCache[name];
+  }
+
+  try {
+    const ps = '$v=[Environment]::GetEnvironmentVariable(\'' + String(name).replace(/'/g, "''") + '\',\'User\'); if($v){$v}';
+    const out = cp.execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true
+    });
+    const value = String(out || '').trim();
+    _winUserEnvCache[name] = value;
+    return value;
+  } catch (_) {
+    _winUserEnvCache[name] = '';
+    return '';
+  }
+}
+
+function readEffectiveEnvValue(name) {
+  const fromProcess = String(process.env[name] || '').trim();
+  if (fromProcess) return fromProcess;
+  return readWindowsUserEnvVar(name);
 }
 
 function buildMcpEnv(serverEnv) {
@@ -735,18 +764,23 @@ function createMcpClient(launch) {
 
   function parseFrames() {
     while (true) {
-      const headerEnd = stdoutBuf.indexOf('\r\n\r\n');
+      let headerEnd = stdoutBuf.indexOf('\r\n\r\n');
+      let headerSepLen = 4;
+      if (headerEnd === -1) {
+        headerEnd = stdoutBuf.indexOf('\n\n');
+        headerSepLen = 2;
+      }
       if (headerEnd === -1) return;
 
       const headerText = stdoutBuf.slice(0, headerEnd).toString('utf8');
       const lenMatch = headerText.match(/Content-Length:\s*(\d+)/i);
       if (!lenMatch) {
-        stdoutBuf = stdoutBuf.slice(headerEnd + 4);
+        stdoutBuf = stdoutBuf.slice(headerEnd + headerSepLen);
         continue;
       }
 
       const len = Number(lenMatch[1]);
-      const frameStart = headerEnd + 4;
+      const frameStart = headerEnd + headerSepLen;
       const frameEnd = frameStart + len;
       if (stdoutBuf.length < frameEnd) return;
 
@@ -822,35 +856,6 @@ function createMcpClient(launch) {
   };
 }
 
-function collectUnderlyingKeysFromIssue(issue) {
-  const keys = [];
-  const seen = Object.create(null);
-
-  function add(k) {
-    k = String(k || '').trim();
-    if (!k || seen[k]) return;
-    seen[k] = true;
-    keys.push(k);
-  }
-
-  if (!issue || !issue.fields || typeof issue.fields !== 'object') return keys;
-
-  const subtasks = issue.fields.subtasks;
-  if (Array.isArray(subtasks)) {
-    subtasks.forEach(function(st) { add(st && (st.key || st.issueKey)); });
-  }
-
-  const links = issue.fields.issuelinks;
-  if (Array.isArray(links)) {
-    links.forEach(function(link) {
-      if (link && link.outwardIssue) add(link.outwardIssue.key || link.outwardIssue.issueKey);
-      if (link && link.inwardIssue) add(link.inwardIssue.key || link.inwardIssue.issueKey);
-    });
-  }
-
-  return keys;
-}
-
 async function fetchJiraViaMcp(jiraKey) {
   const health = getMcpConfigHealth();
   const launch = health.launch;
@@ -874,60 +879,86 @@ async function fetchJiraViaMcp(jiraKey) {
     await client.request('initialize', {
       protocolVersion: '2024-11-05',
       capabilities: {},
-      clientInfo: { name: 'sentinel-harvest-wizard', version: '0.2.15' }
-    }, 15000);
+      clientInfo: { name: 'sentinel-harvest-wizard', version: '0.2.16' }
+    }, 90000);
     client.notify('notifications/initialized', {});
-
-    await client.request('tools/call', {
-      name: 'get_jira_current_user',
-      arguments: {}
-    }, 20000);
 
     const rootRaw = await client.request('tools/call', {
       name: 'read_jira_issue',
       arguments: { issueKey: jiraKey }
-    }, 30000);
+    }, 90000);
     const rootParsed = parseMcpToolResult(rootRaw);
     const rootIssue = rootParsed && rootParsed.issue ? rootParsed.issue : rootParsed;
-
-    const underlyingKeys = collectUnderlyingKeysFromIssue(rootIssue).filter(function(k) { return k !== jiraKey; });
-    const underlyingItems = [];
-
-    for (const childKey of underlyingKeys) {
-      try {
-        const childRaw = await client.request('tools/call', {
-          name: 'read_jira_issue',
-          arguments: { issueKey: childKey }
-        }, 20000);
-        const childParsed = parseMcpToolResult(childRaw);
-        underlyingItems.push(childParsed && childParsed.issue ? childParsed.issue : childParsed);
-      } catch (_) {
-        underlyingItems.push({ key: childKey });
-      }
-    }
 
     const normalized = {
       jiraKey: jiraKey,
       fetchedAt: new Date().toISOString(),
-      rootIssue: rootIssue,
-      underlyingKeys: underlyingKeys,
-      underlyingItems: underlyingItems
+      rootIssue: rootIssue
     };
 
     fs.writeFileSync(fetchedPath, JSON.stringify(normalized, null, 2), 'utf8');
     try { if (fs.existsSync(fetchErrorPath)) fs.unlinkSync(fetchErrorPath); } catch (_) {}
   } catch (e) {
     var details = e && (e.message || String(e)) || 'Onbekende fout';
-    if (/ENOENT/i.test(details)) {
-      details += ' (MCP command niet gevonden. Controleer command en args in .vscode/mcp.json.)';
+    try {
+      const issue = await fetchJiraViaRest(jiraKey, launch.mergedEnv);
+      const normalizedFallback = {
+        jiraKey: jiraKey,
+        fetchedAt: new Date().toISOString(),
+        source: 'rest-fallback',
+        rootIssue: issue
+      };
+      fs.writeFileSync(fetchedPath, JSON.stringify(normalizedFallback, null, 2), 'utf8');
+      try { if (fs.existsSync(fetchErrorPath)) fs.unlinkSync(fetchErrorPath); } catch (_) {}
+      return;
+    } catch (restErr) {
+      var restDetails = restErr && (restErr.message || String(restErr)) || 'Onbekende REST-fout';
+      if (/ENOENT/i.test(details)) {
+        details += ' (MCP command niet gevonden. Controleer command en args in .vscode/mcp.json.)';
+      }
+      if (/EINVAL/i.test(details)) {
+        details += ' (Windows spawn-fout. Gebruik een geldig command in .vscode/mcp.json; voor npx op Windows: C:\\Program Files\\nodejs\\npx.cmd.)';
+      }
+      writeFetchError('mcp-fetch-failed', 'Jira ophalen via MCP is mislukt.', details + ' | REST fallback: ' + restDetails);
     }
-    if (/EINVAL/i.test(details)) {
-      details += ' (Windows spawn-fout. Gebruik een geldig command in .vscode/mcp.json; voor npx op Windows: C:\\Program Files\\nodejs\\npx.cmd.)';
-    }
-    writeFetchError('mcp-fetch-failed', 'Jira ophalen via MCP is mislukt.', details);
   } finally {
     if (client) client.close();
   }
+}
+
+async function fetchJiraViaRest(jiraKey, mergedEnv) {
+  const env = mergedEnv && typeof mergedEnv === 'object' ? mergedEnv : process.env;
+  const baseUrl = String(env.ATLASSIAN_BASE_URL || '').trim().replace(/\/+$/, '');
+  const email = String(env.ATLASSIAN_EMAIL || '').trim();
+  const token = String(env.ATLASSIAN_API_TOKEN || '').trim();
+
+  if (!baseUrl || !email || !token) {
+    throw new Error('Ontbrekende REST-credentials (ATLASSIAN_BASE_URL, ATLASSIAN_EMAIL, ATLASSIAN_API_TOKEN).');
+  }
+
+  const url = baseUrl + '/rest/api/3/issue/' + encodeURIComponent(jiraKey);
+  const auth = Buffer.from(email + ':' + token, 'utf8').toString('base64');
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Accept': 'application/json',
+      'Authorization': 'Basic ' + auth
+    }
+  });
+
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (_) { data = null; }
+
+  if (!response.ok) {
+    const details = data && (data.errorMessages || data.errors)
+      ? JSON.stringify({ errorMessages: data.errorMessages || [], errors: data.errors || {} })
+      : (text || ('HTTP ' + response.status));
+    throw new Error('REST issue fetch failed: ' + response.status + ' ' + details);
+  }
+
+  return data;
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,8 +1106,8 @@ const server = http.createServer(async function(req, res) {
     setTimeout(function() {
       if (fetchFinished) return;
       if (fs.existsSync(fetchedPath) || fs.existsSync(fetchErrorPath)) return;
-      writeFetchError('mcp-timeout', 'Jira ophalen via MCP duurt te lang.', 'Er is na 75 seconden geen resultaat ontvangen van de MCP-server. Controleer netwerk, credentials en MCP package startup.');
-    }, 75000);
+      writeFetchError('mcp-timeout', 'Jira ophalen via MCP duurt te lang.', 'Er is na 120 seconden geen resultaat ontvangen van de MCP-server. Eerste startup via npx kan langer duren. Controleer netwerk, credentials en MCP package startup.');
+    }, 120000);
 
     try { if (fs.existsSync(warningPath)) fs.unlinkSync(warningPath); } catch(_){ }
     res.writeHead(302, { Location: '/working' }); res.end();
@@ -1392,65 +1423,73 @@ const server = http.createServer(async function(req, res) {
       return String(issue.summary || issue.title || '').trim();
     }
 
-    function collectUnderlying(data, rootKey) {
-      var items = [];
-      var seen = Object.create(null);
+    function extractAdfText(node) {
+      if (!node) return '';
+      if (typeof node === 'string') return node;
+      if (Array.isArray(node)) {
+        return node.map(extractAdfText).filter(Boolean).join('');
+      }
+      if (typeof node !== 'object') return '';
 
-      function addIssueLike(v) {
-        if (!v) return;
-        var k = '';
-        if (typeof v === 'string') {
-          k = v.trim();
-        } else if (typeof v === 'object') {
-          k = getIssueKey(v);
-          if (!k && v.outwardIssue) k = getIssueKey(v.outwardIssue);
-          if (!k && v.inwardIssue) k = getIssueKey(v.inwardIssue);
-          if (!k && v.issue) k = getIssueKey(v.issue);
-        }
-        if (!k || k === rootKey || seen[k]) return;
-        seen[k] = true;
-        items.push(k);
+      if (node.type === 'text') {
+        return String(node.text || '');
       }
 
-      function addArray(arr) {
-        if (!Array.isArray(arr)) return;
-        arr.forEach(addIssueLike);
+      const content = Array.isArray(node.content) ? node.content : [];
+      const inner = content.map(extractAdfText).join('');
+
+      if (node.type === 'paragraph' || node.type === 'heading' || node.type === 'listItem') {
+        return inner + '\n';
+      }
+      if (node.type === 'hardBreak') {
+        return '\n';
       }
 
-      if (data && typeof data === 'object') {
-        addArray(data.underlyingItems);
-        addArray(data.childIssues);
-        addArray(data.linkedIssues);
-        addArray(data.descendants);
+      return inner;
+    }
 
-        var root = pickRootIssue(data);
-        if (root && root.fields && typeof root.fields === 'object') {
-          addArray(root.fields.subtasks);
-          addArray(root.fields.issuelinks);
-        }
+    function getIssueDescription(issue) {
+      if (!issue || !issue.fields || typeof issue.fields !== 'object') return '';
+      const d = issue.fields.description;
+      if (!d) return '';
+      if (typeof d === 'string') return d.trim();
+      if (typeof d === 'object') return extractAdfText(d).replace(/\n{3,}/g, '\n\n').trim();
+      return '';
+    }
 
-        if (Array.isArray(data.issues)) {
-          data.issues.forEach(function(it) {
-            addIssueLike(it);
-            if (it && it.fields && typeof it.fields === 'object') {
-              addArray(it.fields.subtasks);
-              addArray(it.fields.issuelinks);
-            }
-          });
-        }
-      }
-
-      items.sort();
-      return items;
+    function getIssueAttachments(issue) {
+      if (!issue || !issue.fields || typeof issue.fields !== 'object') return [];
+      const arr = issue.fields.attachment;
+      return Array.isArray(arr) ? arr : [];
     }
 
     var root = pickRootIssue(fetched) || {};
     var rootKey = getIssueKey(root);
     var rootTitle = getIssueTitle(root);
-    var underlyingKeys = collectUnderlying(fetched, rootKey);
-    var listHtml = underlyingKeys.length
-      ? '<ul>' + underlyingKeys.map(function(k){ return '<li>' + escHtml(k) + '</li>'; }).join('') + '</ul>'
-      : '<p class="empty">Geen onderliggende items gevonden in de fetch-output.</p>';
+    var rootLabel = rootKey || 'Onbekend';
+    if (rootTitle) {
+      rootLabel += ' - ' + rootTitle;
+    }
+
+    var description = getIssueDescription(root);
+    var descriptionHtml = description
+      ? '<div style="white-space:pre-wrap;background:#f7f8fa;border:1px solid #dfe1e6;padding:12px;border-radius:8px;">' + escHtml(description) + '</div>'
+      : '<p class="empty">Geen beschrijving gevonden.</p>';
+
+    var attachments = getIssueAttachments(root);
+    var attachmentsHtml = attachments.length
+      ? '<ul>' + attachments.map(function(a, idx) {
+        var fileName = String((a && (a.filename || a.name)) || 'Onbekende bijlage');
+        var attachmentId = String((a && (a.id || a.attachmentId)) || '');
+        return '<li style="display:flex;align-items:flex-start;gap:10px;">'
+          + '<input type="checkbox" class="att-inc" name="attachmentInclude" checked '
+          + 'data-index="' + String(idx) + '" '
+          + 'data-id="' + escHtml(attachmentId) + '" '
+          + 'data-filename="' + escHtml(fileName) + '">'
+          + '<span>' + escHtml(rootLabel) + ' | ' + escHtml(fileName) + '</span>'
+          + '</li>';
+      }).join('') + '</ul>'
+      : '<p class="empty">Geen bijlagen gevonden.</p>';
 
     var html = '<!DOCTYPE html><html lang="nl" translate="no"><head>'
       + '<meta charset="UTF-8"><style>' + SUMMARY_CSS + '</style></head><body>'
@@ -1461,10 +1500,14 @@ const server = http.createServer(async function(req, res) {
       + '<span class="issue-title">' + escHtml(rootTitle || 'Jira item opgehaald') + '</span>'
       + '</div></div>'
       + '<h2>Opgehaald</h2>'
-      + '<div class="h-item"><span class="h-label">Root item</span><span class="h-value">' + escHtml(rootKey || 'Onbekend') + '</span></div>'
-      + '<div class="h-item"><span class="h-label">Onderliggende items</span><span class="h-value">' + String(underlyingKeys.length) + '</span></div>'
-      + '<h2>Onderliggende Jira-items</h2>'
-      + listHtml
+      + '<div class="h-item" style="display:flex;align-items:flex-start;gap:6px;white-space:normal;overflow:visible">'
+      + '<span style="font-size:.82rem;font-weight:700;color:#666;letter-spacing:.01em;white-space:nowrap">Root item:</span>'
+      + '<span class="h-value" style="flex:1;min-width:0;white-space:normal;overflow-wrap:anywhere;word-break:break-word">' + escHtml(rootLabel) + '</span>'
+      + '</div>'
+      + '<h2>Beschrijving</h2>'
+      + descriptionHtml
+      + '<h2>Bijlagen</h2>'
+      + attachmentsHtml
       + '<div class="actions">'
       + '<button class="btn" id="btnOk" onclick="bevestig()">Bevestigen</button>'
       + '<button type="button" class="btn btn-cancel" onclick="location.href=\'/cancel\'">Annuleren</button>'
@@ -1473,7 +1516,19 @@ const server = http.createServer(async function(req, res) {
       + 'function bevestig(){'
       + '  document.getElementById("btnOk").disabled=true;'
       + '  document.getElementById("btnOk").textContent="Bezig\u2026";'
-      + '  fetch("/bevestigen").then(function(){'
+      + '  var selected = Array.prototype.slice.call(document.querySelectorAll("input[name=attachmentInclude]")).map(function(el){'
+      + '    return {'
+      + '      index: Number(el.getAttribute("data-index") || 0),'
+      + '      id: el.getAttribute("data-id") || "",'
+      + '      filename: el.getAttribute("data-filename") || "",'
+      + '      include: !!el.checked'
+      + '    };'
+      + '  });'
+      + '  fetch("/bevestigen", {'
+      + '    method: "POST",'
+      + '    headers: {"Content-Type":"application/json"},'
+      + '    body: JSON.stringify({ selectedAttachments: selected })'
+      + '  }).then(function(){'
       + '    document.body.innerHTML=\'<div style="text-align:center;padding:80px 24px">\'+'
       + '\'<h2 style="color:#0052cc">Jira-data bevestigd!</h2>\'+'
       + '\'<p style="color:#666">Harvest fetch is afgerond. Je kunt nu terug naar VS Code.</p></div>\';'
@@ -1591,6 +1646,24 @@ const server = http.createServer(async function(req, res) {
     // Re-write answers JSON with the harvest file path for downstream use.
     let answers = {};
     try { answers = JSON.parse(fs.readFileSync(answersPath, 'utf8')); } catch (_) {}
+    if (req.method === 'POST') {
+      try {
+        const rawBody = await readBody(req);
+        if (rawBody) {
+          const payload = JSON.parse(rawBody);
+          if (payload && Array.isArray(payload.selectedAttachments)) {
+            answers.selectedAttachments = payload.selectedAttachments.map(function(item) {
+              return {
+                index: Number(item && item.index || 0),
+                id: String(item && item.id || ''),
+                filename: String(item && item.filename || ''),
+                include: !!(item && item.include)
+              };
+            });
+          }
+        }
+      } catch (_) {}
+    }
     const confirmedKey = answers.jiraKey || '';
     if (confirmedKey) {
       answers.harvestFile = path.join(WORKSPACE, '01-Harvest-Jira-Summaries', 'Harvest-' + confirmedKey + '.md');

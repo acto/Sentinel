@@ -1,0 +1,20 @@
+{
+  "servers": {
+    "mcp-atlassian": {
+      "command": "npx.cmd",
+      "args": [
+        "-y",
+        "-p",
+        "jsdom",
+        "-p",
+        "mcp-atlassian",
+        "mcp-atlassian"
+      ],
+      "env": {
+        "ATLASSIAN_BASE_URL": "${input:atlassian_baseurl}",
+        "ATLASSIAN_EMAIL": "${input:atlassian_email}",
+        "ATLASSIAN_API_TOKEN": "${input:atlassian_api_token}"
+      }
+    }
+  }
+}
