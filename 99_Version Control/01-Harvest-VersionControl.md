@@ -270,3 +270,7 @@
 ## 2026-08-11 - v0.2.59
 - Restored missing skill files under `.github/skills` after branch alignment moved to a commit state without the skill directory.
 - Recreated `fetch-jira-items`, `jira-items-analyse`, and `jira-summary` skill definitions.
+
+## 2026-08-12 - v0.2.60
+- Fixed prompt frontmatter in `Prompts/01-Harvest-Read-Jira.prompt.md` by changing `agent: "01-Harvest-Read-Jira"` to the valid built-in `agent: "agent"`.
+- Resolved the prompt validation problem: `Unknown agent '01-Harvest-Read-Jira'`.
